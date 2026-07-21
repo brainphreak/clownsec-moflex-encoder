@@ -67,11 +67,23 @@ python3 tools/moflex_combine.py combine out.moflex seg1.moflex seg2.moflex [...]
 
 - [x] Understand the moflex container block format (see `docs/moflex-format.md`)
 - [x] `moflex_combine.py` — lossless segment combiner (validated vs our decoder)
+- [x] **On-device validation** — a combined file (two independently-encoded 3D clips
+      joined) plays clean on hardware: audio synced across the seam, 3D intact, one
+      continuous file. Confirmed 2026-07-21.
 - [ ] **Source splitter** — cut the MP4 at keyframe- *and* eye-pair-aligned boundaries
       so each chunk encodes into a seam-safe 3D segment (each segment must start on a
       keyframe and on the **Left** eye, or 3D parity can flip at a join)
-- [ ] End-to-end workflow script + on-device (3DS) validation of a combined file
+- [ ] End-to-end workflow script
 - [ ] Parallel-encode harness (Sandboxie / multi-session driver for the GUI)
+
+### Combiner test results (vs our bit-exact decoder)
+
+| Test | Result |
+|---|---|
+| split one file → rejoin | **byte-identical** to original (same size, audio bit-identical) |
+| combine 2 same-fps clips | audio + video = exact sum; plays clean on-device ✅ |
+| combine 3 clips | audio + video = exact sum |
+| Nintendo file (48 kHz, 2 KB blocks, 12 min) | audio bit-identical over 744 s |
 
 ## Seam requirements (3D)
 
