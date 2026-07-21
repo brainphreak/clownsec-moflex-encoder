@@ -58,7 +58,9 @@ The real encoder logic is in the x264 fork (`quatric/x264`), driven by `libavcod
 in mobipeg. Plan, highest value first, each validated by encoding a clip and decoding it
 with our bit-exact decoder (`pc_verify/`):
 
-1. **Enable 8×8 transform** using the decoder's `idct8_pair` as the reference (biggest win).
+1. **Enable 8×8 transform** — ✅ **DONE & VERIFIED** (see `patches/`, `progress.md`).
+   Inter luma now uses the decoder-exact `mobi_add8x8_idct8`/`mobi_quant_8x8`. Round-trips
+   bit-exact; saves **36–49 % bitrate at qyx2–3** for ~0 PSNR change. Env-gated (`MOBI_8X8`).
 2. **Enable sub-partitions** (let the encoder emit the split codes the decoder already reads).
 3. **Enable skip blocks** (index-0 + zero residual for static regions).
 4. **Raise `MOBICLIP_KEYINT_MAX`** (mobipeg's `encode.py` forces a keyframe every ≤90

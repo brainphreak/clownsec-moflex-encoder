@@ -1,0 +1,25 @@
+diff --git a/libavcodec/libx264.c b/libavcodec/libx264.c
+index 9a625c7..7544dfe 100644
+--- a/libavcodec/libx264.c
++++ b/libavcodec/libx264.c
+@@ -1296,10 +1296,16 @@ static av_cold int X264_init(AVCodecContext *avctx)
+     if (x4->mixed_refs >= 0)
+         x4->params.analyse.b_mixed_references = x4->mixed_refs;
+     if (x4->i_mobiclip) {
+-        /* MobiClip's 8x8 IDCT (even/odd butterfly) differs from x264's DCT8_1D
+-         * for non-DC coefficients; force 4x4-only which uses the same inverse4
+-         * butterfly in both encoder and decoder. */
+-        x4->params.analyse.b_transform_8x8    = 0;
++        /* MobiClip 8x8 luma transform: mobipeg historically forced 4x4-only
++         * because x264's DCT8_1D differs from MobiClip's inverse.  We now have
++         * the decoder-exact mobi 8x8 transform (mobi_add8x8_idct8 + mobi_quant_8x8,
++         * already used for chroma) wired into the inter luma path (macroblock.c).
++         * Enabling params.analyse.b_transform_8x8 sets pps->b_transform_8x8_mode
++         * (required so x264_mb_transform_8x8_allowed() -> the cavlc use8x8 branch
++         * can fire).  Intra stays I_4x4 (hard-forced in analyse.c), so this only
++         * affects inter MBs.  Gated by MOBI_8X8 so the default build reproduces
++         * the 4x4 baseline byte-for-byte for A/B testing. */
++        x4->params.analyse.b_transform_8x8    = getenv("MOBI_8X8") ? 1 : 0;
+         /* Cap the motion-search range.  At scene cuts x264 finds spurious
+          * far-away matches producing large motion vectors.  Such large MVs
+          * propagate through MobiClip's median MV predictor (a per-column ring

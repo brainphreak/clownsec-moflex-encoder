@@ -1,0 +1,94 @@
+diff --git a/encoder/encoder.c b/encoder/encoder.c
+index c00dcf6..4ea9b95 100644
+--- a/encoder/encoder.c
++++ b/encoder/encoder.c
+@@ -1220,12 +1220,17 @@ static int validate_parameters( x264_t *h, int b_open )
+     h->param.analyse.intra &= X264_ANALYSE_I4x4|X264_ANALYSE_I8x8;
+     if( !(h->param.analyse.inter & X264_ANALYSE_PSUB16x16) )
+         h->param.analyse.inter &= ~X264_ANALYSE_PSUB8x8;
+-    /* Mobiclip: force 4x4 luma transform.  4x4 round-trips exactly against the
+-     * decoder; luma 8x8 currently reconstructs incorrectly.  Chroma is always
+-     * coded 8x8 (its quant tables are force-initialized in x264_cqm_init). */
++    /* Mobiclip luma transform.  4x4 round-trips exactly against the decoder;
++     * the decoder-exact 8x8 luma path (mobi_quant_8x8 + mobi_add8x8_idct8, the
++     * same math already used for chroma) is now wired into the inter luma
++     * encode (macroblock.c) and the cavlc use8x8 branch.  Enabling
++     * analyse.b_transform_8x8 sets pps->b_transform_8x8_mode so
++     * x264_mb_transform_8x8_allowed() lets it fire; intra stays I_4x4
++     * (hard-forced in analyse.c).  Gated by MOBI_8X8 so the default build
++     * reproduces the 4x4 baseline byte-for-byte during A/B validation. */
+     if( h->param.i_mobiclip )
+     {
+-        h->param.analyse.b_transform_8x8 = 0;
++        h->param.analyse.b_transform_8x8 = getenv("MOBI_8X8") ? 1 : 0;
+         h->param.b_deblocking_filter = 0;
+         h->param.i_bframe = 0;
+         /* Reference only the immediately previous frame.  The Mobiclip P-frame
+diff --git a/encoder/macroblock.c b/encoder/macroblock.c
+index 96bd436..f64025b 100644
+--- a/encoder/macroblock.c
++++ b/encoder/macroblock.c
+@@ -1093,6 +1093,15 @@ static ALWAYS_INLINE void macroblock_encode_internal( x264_t *h, int plane_count
+          * residual reconstructs correctly in the Mobiclip decoder. */
+     if( h->param.i_mobiclip )
+             mobi_motion_compensate( h );
++        /* 8x8-luma round-trip test: force the 8x8 transform on every eligible
++         * inter MB when MOBI_8X8 is set.  Gate on x264_mb_transform_8x8_allowed()
++         * so the flag we set here is IDENTICAL to what cavlc's use8x8 gate
++         * (allowed && b_transform_8x8) sees — otherwise the encode would emit an
++         * 8x8 block the bitstream writer codes as 4x4, desyncing the decoder.
++         * Skip MBs (no residual) and non-allowed types stay 4x4. */
++        if( h->param.i_mobiclip && !b_mobi_skip && getenv("MOBI_8X8")
++            && x264_mb_transform_8x8_allowed( h ) )
++            h->mb.b_transform_8x8 = 1;
+ #endif
+ 
+         if( h->mb.b_lossless )
+@@ -1127,6 +1136,47 @@ static ALWAYS_INLINE void macroblock_encode_internal( x264_t *h, int plane_count
+             for( int p = 0; p < plane_count; p++ )
+                 CLEAR_16x16_NNZ( p );
+         }
++        else if( h->param.i_mobiclip && h->mb.b_transform_8x8 )
++        {
++            /* Mobiclip 8x8 inter luma residual — decoder-exact, mirrors the
++             * chroma template (mb_encode_chroma_internal): forward sub8x8_dct8
++             * -> mobi_quant_8x8 (LUMA mobi_q8 table) -> store coeffs via
++             * mobi_zigzag8x8 into luma8x8[] -> reconstruct with the decoder's
++             * exact mobi_add8x8_idct8.  cavlc's use8x8 branch emits the
++             * "idx==0" single-8x8 syntax the decoder's add_pframe_coefficients
++             * reads.  Only the per-8x8 representative nnz (scan8[i8*4]) is what
++             * cavlc consults, matching the chroma convention. */
++            for( int p = 0; p < plane_count; p++, i_qp = h->mb.i_qp )
++            {
++                CLEAR_16x16_NNZ( p );
++                int qx = i_qp % 6;
++                int qtab[64];
++                for( int zz = 0; zz < 64; zz++ )
++                    qtab[mobi_zigzag8x8[zz]] = (int)mobi_q8[qx][zz] << mobi_qyx( h );
++                for( int i8 = 0; i8 < 4; i8++ )
++                {
++                    int ox = 8*(i8&1), oy = 8*(i8>>1);
++                    pixel *p_src = h->mb.pic.p_fenc[p] + ox + oy*FENC_STRIDE;
++                    pixel *p_dst = h->mb.pic.p_fdec[p] + ox + oy*FDEC_STRIDE;
++                    ALIGNED_ARRAY_64( dctcoef, dct8x8,[64] );
++                    h->dctf.sub8x8_dct8( dct8x8, p_src, p_dst );
++                    nz = mobi_quant_8x8( h, dct8x8, i_qp, 0 /*inter*/ );
++                    if( nz )
++                    {
++                        for( int i = 0; i < 64; i++ )
++                            h->dct.luma8x8[p*4+i8][i] = dct8x8[mobi_zigzag8x8[i]];
++                        int mat[64];
++                        for( int i = 0; i < 64; i++ )
++                            mat[i] = (int)dct8x8[i] * qtab[i];
++                        mobi_add8x8_idct8( p_dst, mat );
++                        h->mb.cache.non_zero_count[x264_scan8[p*16+i8*4]] = 1;
++                        h->mb.i_cbp_luma |= 1 << i8;
++                    }
++                    else
++                        h->mb.cache.non_zero_count[x264_scan8[p*16+i8*4]] = 0;
++                }
++            }
++        }
+         else if( h->param.i_mobiclip )
+         {
+             /* Inter luma residual.  x264's standard quant_4x4x4 + dequant_4x4 +

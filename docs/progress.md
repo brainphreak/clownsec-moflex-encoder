@@ -2,6 +2,44 @@
 
 Running log of verified results, build setup, and current state. Newest at top.
 
+## 8×8 luma transform — IMPLEMENTED & VERIFIED (2026-07-21)
+
+The biggest efficiency lever is done and measured. mobipeg only ever coded luma
+with the 4×4 transform; MobiClip also supports an **8×8 luma transform** (the same
+`mobi_add8x8_idct8` / `mobi_quant_8x8` math already used for chroma). Wiring it into
+the inter luma encode path closes a large part of the efficiency gap.
+
+**Patches** (in `patches/`, apply to `quatric/x264` + `quatric/mobipeg`):
+- `x264-mobiclip-8x8-luma.patch` — adds the 8×8 inter-luma residual path in
+  `encoder/macroblock.c` (forward `sub8x8_dct8` → `mobi_quant_8x8` with the luma
+  `mobi_q8` table → store via `mobi_zigzag8x8` → reconstruct with `mobi_add8x8_idct8`),
+  and lets `pps->b_transform_8x8_mode` be set for MobiClip so the (already-present)
+  cavlc `use8x8` branch can fire. Intra stays I_4x4 (hard-forced in `analyse.c`).
+- `mobipeg-mobiclip-8x8-luma.patch` — stops force-disabling 8×8 in `libavcodec/libx264.c`.
+- Gated behind env `MOBI_8X8` so the default build still reproduces the 4×4 baseline
+  byte-for-byte (clean A/B testing on one binary).
+
+**Verified results** — single 400×240 eye, 72 frames, decoded with our bit-exact
+decoder (`tdec`), PSNR vs the raw source:
+
+| qyx | baseline 4×4 | 8×8 luma | bitrate saved | ΔPSNR |
+|----|--------------|----------|---------------|-------|
+| 2 | 558.6 kb/s @ 41.31 dB | 285.8 kb/s @ 41.17 dB | **48.8 %** | −0.14 dB |
+| 3 | 271.8 kb/s @ 39.54 dB | 173.6 kb/s @ 39.42 dB | **36.1 %** | −0.12 dB |
+| 4 | 153.4 kb/s @ 37.68 dB | 127.8 kb/s @ 37.65 dB | 16.7 % | −0.03 dB |
+| 5 | 112.0 kb/s @ 35.63 dB | 106.9 kb/s @ 35.81 dB | 4.6 % | +0.18 dB |
+
+The largest savings land at the **high-quality end (qyx2–3)** — exactly where good 3D
+encodes live — for a negligible PSNR change. Correctness confirmed three ways: (1) both
+streams decode all frames with **no desync**; (2) per-frame PSNR is **flat across the
+whole GOP** (no accumulating drift — a wrong 8×8 IDCT would make PSNR fall monotonically
+toward the last frame; it doesn't); (3) full 3D interleaved encode (`clip.mkv`, qyx2)
+decodes to visually identical frames at **10.1 MB vs 13.2 MB (−24 %)**.
+
+Next: let the RD mode decision *choose* 8×8 vs 4×4 per-MB (currently forced on for all
+eligible inter MBs), which should recover the few cases where 4×4 wins (e.g. qyx5) and
+push savings higher. Then sub-partitions, skip tuning, keyframe cap.
+
 ## Verified results (2026-07-21)
 
 - **Working 3D pipeline plays on BOTH players.** qyx5 (~1.4 Mbps) confirmed on-device
