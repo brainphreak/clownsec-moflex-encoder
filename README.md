@@ -40,6 +40,37 @@ perfectly, but its muxer **truncates the audio** on stream-copy of 3D content
 bit-exact decoder: a 45 s clip came out with 2.9 s of audio. So the combine has to
 happen at the container-block level instead — which is what `moflex_combine.py` does.
 
+## Full workflow
+
+```bash
+# 1. split the full-SBS (or over-under) source into chunks — lossless, fast
+python3 tools/moflex_split.py source_sbs.mp4 chunks/ --parts 6
+
+# 2. encode EACH chunk to .moflex with the Nintendo Mobiclip GUI.
+#    Each chunk is small, so its O(n^2) finalize is fast; run several at once via
+#    Sandboxie / separate Windows sessions (the single-instance lock is only in the
+#    GUI shell) for the full k^2 speedup.  ->  chunk_000.moflex ... chunk_005.moflex
+
+# 3. join the encoded segments into one file — lossless, audio + 3D intact
+python3 tools/moflex_combine.py combine movie.moflex \
+    chunks/chunk_000.moflex chunks/chunk_001.moflex ... chunks/chunk_005.moflex
+```
+
+Because the source is full-SBS/over-under (every frame carries both eyes), any cut is
+pair-safe, and each independently-encoded chunk starts Left-first with an even frame
+count — so 3D eye-parity stays correct at every seam automatically.
+
+## tools/moflex_split.py
+
+Cuts a full-SBS / over-under source video into chunks for parallel encoding. Lossless
+(`-c copy`) keyframe-aligned cuts — no re-encode, so zero quality loss before the
+Mobiclip pass, and each chunk starts on a keyframe (independently decodable input for
+the encoder). Verified frame-exact (1440 in → 1440 across chunks).
+
+```
+python3 tools/moflex_split.py source.mp4 out_dir/ --parts 6      # or --seconds 180
+```
+
 ## tools/moflex_combine.py
 
 Losslessly joins independently-encoded `.moflex` segments into one file.
@@ -70,11 +101,12 @@ python3 tools/moflex_combine.py combine out.moflex seg1.moflex seg2.moflex [...]
 - [x] **On-device validation** — a combined file (two independently-encoded 3D clips
       joined) plays clean on hardware: audio synced across the seam, 3D intact, one
       continuous file. Confirmed 2026-07-21.
-- [ ] **Source splitter** — cut the MP4 at keyframe- *and* eye-pair-aligned boundaries
-      so each chunk encodes into a seam-safe 3D segment (each segment must start on a
-      keyframe and on the **Left** eye, or 3D parity can flip at a join)
-- [ ] End-to-end workflow script
-- [ ] Parallel-encode harness (Sandboxie / multi-session driver for the GUI)
+- [x] **Source splitter** (`moflex_split.py`) — lossless keyframe-aligned cuts of the
+      full-SBS/over-under source; frame-exact. Pair-safe because every source frame
+      already holds both eyes.
+- [x] End-to-end workflow (split → encode chunks → combine) — see above
+- [ ] Parallel-encode harness (Sandboxie / multi-session driver for the GUI) — optional
+      convenience; the manual multi-instance route already works
 
 ### Combiner test results (vs our bit-exact decoder)
 
