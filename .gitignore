@@ -1,0 +1,10 @@
+# work products / large media
+*.moflex
+*.mp4
+*.mkv
+*.pcm
+*.wav
+seg*/
+out/
+scratch/
+.DS_Store
