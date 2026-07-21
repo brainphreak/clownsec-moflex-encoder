@@ -60,6 +60,17 @@ Because the source is full-SBS/over-under (every frame carries both eyes), any c
 pair-safe, and each independently-encoded chunk starts Left-first with an even frame
 count — so 3D eye-parity stays correct at every seam automatically.
 
+## Encoding a 3D source (mobipeg baseline)
+
+`tools/moflex_encode3d.sh <input_sbs.(mkv|mp4)> <qyx> <out.moflex>` encodes a full-SBS 3D
+source into a frame-interleaved `.moflex` that plays on **both** the official 3DS player and
+the clownsec player (framepack → mobipeg → make3d → patch_ts). This is the **baseline**
+encoder — mobipeg's MobiClip coder is ~3× less efficient than the official one. See
+**[docs/encoder-analysis.md](docs/encoder-analysis.md)** for the efficiency analysis
+(verified against our decoder: 8×8 transform, sub-partitions, and skip blocks are all
+MobiClip-legal tools mobipeg leaves unused — the fixable path to closing the gap) and the
+roadmap for our own improved encoder.
+
 ## tools/moflex_split.py
 
 Cuts a full-SBS / over-under source video into chunks for parallel encoding. Lossless
