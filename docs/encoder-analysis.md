@@ -59,7 +59,7 @@ in mobipeg. Plan, highest value first, each validated by encoding a clip and dec
 with our bit-exact decoder (`pc_verify/`):
 
 1. **Enable 8×8 transform** — ✅ **DONE & VERIFIED** (see `patches/`, `progress.md`).
-   Inter luma now uses the decoder-exact `mobi_add8x8_idct8`/`mobi_quant_8x8`. Round-trips
+   Inter AND intra luma now use the decoder-exact `mobi_add8x8_idct8`/`mobi_quant_8x8`. Round-trips
    bit-exact; saves **36–49 % bitrate at qyx2–3** for ~0 PSNR change. Env-gated (`MOBI_8X8`).
 2. **Enable sub-partitions** (let the encoder emit the split codes the decoder already reads).
 3. **Enable skip blocks** (index-0 + zero residual for static regions).

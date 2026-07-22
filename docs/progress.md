@@ -2,7 +2,41 @@
 
 Running log of verified results, build setup, and current state. Newest at top.
 
-## 8×8 luma transform — IMPLEMENTED & VERIFIED (2026-07-21)
+## 8×8 INTRA luma + keyframe-flash fix — VERIFIED (2026-07-21)
+
+Follow-up to the inter 8×8 work below. Enabling 8×8 only on P-frames left I-frames
+on the 4×4 transform, so every keyframe showed a brief **grain/noise pulse** (the
+4×4 I-frame keeps high-frequency detail the smoother 8×8 P-frames dropped). Confirmed
+by per-frame high-frequency energy: 8×8-P-only had a sharp HF spike at every I-frame
+(ratio 1.42× the neighbours, every ~90 interleaved frames); baseline 4×4 was flat.
+
+**Fix: code I-frames 8×8 too.** Added a decoder-exact 8×8 **intra** luma path:
+- `mobi_predict_8x8` / `mobi_pget8` (macroblock.h) — a faithful size-8 port of the
+  proven `mobi_predict_4x4`, matching the decoder's `predict_intra(size=8)` /
+  `intra_predict_fill` for all directional modes (0,1,3,4–8). Plane (mode 2) stays a
+  16×16-MB predictor as in the decoder. Edge blocks forced to DC in
+  `intra4x4_pred_mode` itself so encode and cavlc write the same mode.
+- Intra 8×8 encode branch in `macroblock.c` (predict → `mobi_quant_8x8` intra →
+  `mobi_add8x8_idct8`), then set `i_type=I_8x8` + `b_transform_8x8` so the existing
+  cavlc I_8x8 branch emits the mask + 8×8 syntax. Same `MOBI_8X8` flag as inter (they
+  MUST go together — 8×8-P beside 4×4-I is what causes the flash).
+
+**Verified:**
+- **Flash gone**: 8×8-P+I shows **0 I-frame HF spikes** (was 3, worst 1.42×).
+- **Intra bit-exact**: I-frame-only clip decodes cleanly (a wrong 8×8 IDCT would
+  desync the neighbour-dependent intra and drop PSNR to garbage; it stays ~40.8 dB).
+- **Net win over the 4×4 baseline** (Micro Monsters, busy 3D nature footage, current
+  binary): qyx2 6684→4975 kb/s (**−26 %**), qyx4 1934→1244 kb/s (**−36 %**). I-frames
+  (the biggest frames) shrink 22–33 %.
+- Full-pipeline 3D I-frame renders clean (centipede-on-litter, no artifacts).
+
+**Build gotcha (cost real debugging time):** FFmpeg's `ffmpeg` target does **not**
+depend on the external `x264-inst/lib/libx264.a`, so `make ffmpeg` will NOT relink
+when only libx264 changed → you silently keep testing the old encoder. Always force a
+relink after rebuilding x264: `rm -f ffmpeg ffmpeg_g && touch libavcodec/libx264.c &&
+make -j ffmpeg`.
+
+## 8×8 luma transform (inter) — IMPLEMENTED & VERIFIED (2026-07-21)
 
 The biggest efficiency lever is done and measured. mobipeg only ever coded luma
 with the 4×4 transform; MobiClip also supports an **8×8 luma transform** (the same
