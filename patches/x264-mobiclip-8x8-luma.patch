@@ -30,10 +30,10 @@ index be6b0cd..651ef03 100644
  		int mvy = h->mb.cache.mv[0][x264_scan8[0] + idx][1] >> 1;
  		int dx = mvx - px;
 diff --git a/encoder/encoder.c b/encoder/encoder.c
-index c00dcf6..90423b3 100644
+index c00dcf6..65e8529 100644
 --- a/encoder/encoder.c
 +++ b/encoder/encoder.c
-@@ -1220,24 +1220,38 @@ static int validate_parameters( x264_t *h, int b_open )
+@@ -1220,24 +1220,47 @@ static int validate_parameters( x264_t *h, int b_open )
      h->param.analyse.intra &= X264_ANALYSE_I4x4|X264_ANALYSE_I8x8;
      if( !(h->param.analyse.inter & X264_ANALYSE_PSUB16x16) )
          h->param.analyse.inter &= ~X264_ANALYSE_PSUB8x8;
@@ -79,14 +79,23 @@ index c00dcf6..90423b3 100644
 +         * sub-partitions (16x8/8x16/8x8 and, with PSUB8x8, down to 4x4) so the
 +         * encoder can fit complex motion — the biggest quality lever on motion
 +         * content.  Keep I4x4/I8x8 intra flags either way (no I16x16). */
-+        if( getenv("MOBI_PSUB") )
-+            h->param.analyse.inter |= X264_ANALYSE_I4x4|X264_ANALYSE_I8x8|X264_ANALYSE_PSUB16x16|X264_ANALYSE_PSUB8x8;
-+        else
-+            h->param.analyse.inter &= X264_ANALYSE_I4x4|X264_ANALYSE_I8x8;
++        {
++            const char *ps = getenv("MOBI_PSUB");
++            int psub = ps ? atoi(ps) : 0;
++            if( psub >= 2 )      /* 16x8/8x16/8x8 AND 8x4/4x8/4x4 (4x4 level has known rare glitches) */
++                h->param.analyse.inter |= X264_ANALYSE_I4x4|X264_ANALYSE_I8x8|X264_ANALYSE_PSUB16x16|X264_ANALYSE_PSUB8x8;
++            else if( psub == 1 ) /* 16x8/8x16/8x8 only */
++            {
++                h->param.analyse.inter |= X264_ANALYSE_I4x4|X264_ANALYSE_I8x8|X264_ANALYSE_PSUB16x16;
++                h->param.analyse.inter &= ~X264_ANALYSE_PSUB8x8;
++            }
++            else
++                h->param.analyse.inter &= X264_ANALYSE_I4x4|X264_ANALYSE_I8x8;
++        }
          /* Sub-pel motion: Mobiclip supports half-pel MC.  The encoder maps
           * x264's quarter-pel cache.mv to Mobiclip's half-pel MV via >>1 in BOTH
           * the reconstruction (mobi_motion_compensate) and the bitstream write
-@@ -1289,11 +1303,16 @@ static int validate_parameters( x264_t *h, int b_open )
+@@ -1289,11 +1312,16 @@ static int validate_parameters( x264_t *h, int b_open )
      }
      h->param.analyse.i_trellis = x264_clip3( h->param.analyse.i_trellis, 0, 2 );
      if( h->param.i_mobiclip )
@@ -104,7 +113,7 @@ index c00dcf6..90423b3 100644
  
      if( h->param.i_log_level < X264_LOG_INFO )
      {
-@@ -2453,6 +2472,7 @@ static inline void reference_build_list( x264_t *h, int i_poc )
+@@ -2453,6 +2481,7 @@ static inline void reference_build_list( x264_t *h, int i_poc )
          }
      }
  

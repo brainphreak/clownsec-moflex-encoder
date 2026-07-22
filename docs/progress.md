@@ -169,3 +169,22 @@ reconstruction matches, then measure kb/s at the same qyx.
   (chroma-only). Work: forward 8×8 transform + quant matching it, wire into luma reconstruction,
   RD mode decision 8×8 vs 4×4, and emit the MobiClip 8×8 coefficient bitstream.
 - Then: sub-partitions, un-gate/tune skip, keyframe cap.
+
+## Sub-partition glitch: 4x4-level splits caused flashing blocks — FIXED (2026-07-22)
+
+User-reported: occasional flashing objects/garbage blocks in qyx0 encodes, clustered at
+letterbox-boundary MB rows. Bisected on full-length encodes (short re-encodes do NOT
+reproduce it — the glitch is state-dependent):
+
+- skip-freeze off (MOBI_SKIP=0): unchanged → not skip
+- short GOP (-g 90): unchanged → not long-GOP drift
+- no sub-partitions: **zero glitches** → sub-partitions
+- sub-partitions WITHOUT the 4x4 level (16x8/8x16/8x8 only): **zero glitches**, and
+  bitrate essentially identical (6044 vs 6097 kb/s — the 4x4 level contributed ~nothing)
+
+`MOBI_PSUB` is now a level: `1` = 16x8/8x16/8x8 (safe, recommended), `2` = adds
+8x4/4x8/4x4 (known rare localized garbage — likely an analysis-vs-mobi-reconstruction
+mismatch at the smallest partition sizes; not debugged further since the level is
+near-worthless for bitrate anyway).
+
+Recommended config unchanged except semantics: `MOBI_8X8=1 MOBI_PSUB=1 MOBI_SUBME=6 MOBI_DZ=3`.
