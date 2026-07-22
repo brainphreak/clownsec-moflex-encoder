@@ -2,6 +2,45 @@
 
 Running log of verified results, build setup, and current state. Newest at top.
 
+## Sub-partitions + RD, fine-QP, deadzone, aspect fix (2026-07-22)
+
+Controlled harness: the Sheep source (`/Volumes/nasGOD/...Sbs.mp4`) encoded by BOTH the
+official encoder (1200 kbps 2-pass moflex) and ours, compared on the same frames.
+
+- **Sub-partitions ENABLED and bit-exact** (`MOBI_PSUB=1`): the fork's H_SPLIT/V_SPLIT
+  writer round-trips fine (the old "doesn't round-trip" comment was stale). **Requires RD
+  (`MOBI_SUBME=6`)** — without RD the split decisions are bad and quality *drops*.
+  With RD: better PSNR at ~36 % lower bitrate on motion content, visibly sharper.
+- **subme6**: only helps via sub-partitions/RD mode decisions; on its own it's
+  content-dependent. The old "subme>=6 inflates files" comment is wrong with psub on.
+- **Fine QP control works**: `-qp N` (12–39) gives 6 sub-steps per qyx level
+  (`step = mobi_q8[qp%6] << qyx`), header written correctly. ~−10 % bitrate per +1 QP.
+- **Quantizer rounding offset (`MOBI_DZ`, default 5)**: it's a round-up offset, not a true
+  deadzone — LOWER = more aggressive. **DZ=3 is the efficiency sweet spot**: at equal
+  bitrate ~+0.15 dB vs QP-stepping, and slightly lower temporal shimmer. DZ=2 is worse.
+- **Keyframe interval**: `-g` works (wrapper honors gop_size; forced 90 by default).
+  Raising to 480 saves only ~1 % now — scene-cut detection places most I-frames anyway.
+  Still worth `-g 480`.
+- **ASPECT BUG FIXED**: eyes were stretched to 400x240 regardless of source shape. An
+  800x200 SBS source (2:1 per eye) must be letterboxed (400x200 + bars), as the official
+  encoder does. `moflex_encode3d.sh` now uses
+  `scale=400:240:force_original_aspect_ratio=decrease,pad=...` per eye.
+- **Head-to-head vs official 1200 kbps, same frames** (after aspect fix): temporal
+  stability (same-eye shimmer, reference-independent): official 4.74 vs ours 5.08 —
+  within ~7 % (was 2.4x worse before this work). Visually the official is still somewhat
+  cleaner at matched bitrate. PSNR across the two is NOT comparable (different
+  scaler/preprocessing chains floor-limit the official's PSNR against our reference).
+- **Remaining gap = rate control.** We are fixed-QP (CQP); the official is 2-pass and
+  redistributes bits by scene complexity (our 2-min encode averaged 1677 kbps with quiet
+  scenes overspent and busy scenes underspent). Two-pass/ABR is the next big lever.
+- Dead ends confirmed: trellis (custom mobi quantizer ignores x264 trellis), AQ (CQP path
+  overrides), multi-ref/same-eye referencing (ruled out against official's own ref mix).
+
+**Current best config** (all env-gated, defaults unchanged):
+`MOBI_8X8=1 MOBI_PSUB=1 MOBI_SUBME=6 MOBI_DZ=3` + `-mobi_qyx 2 -qp <21-24> -g 480`
+with the letterboxing filter. `-qp` fine-tunes bitrate (~1200 kbps at qp 22-23 on
+dialogue-heavy content).
+
 ## 8×8 INTRA luma + keyframe-flash fix — VERIFIED (2026-07-21)
 
 Follow-up to the inter 8×8 work below. Enabling 8×8 only on P-frames left I-frames

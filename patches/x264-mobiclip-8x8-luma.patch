@@ -1,8 +1,39 @@
+diff --git a/encoder/analyse.c b/encoder/analyse.c
+index c524946..da1b3ae 100644
+--- a/encoder/analyse.c
++++ b/encoder/analyse.c
+@@ -1323,6 +1323,14 @@ static void mb_analyse_inter_p16x16( x264_t *h, x264_mb_analysis_t *a )
+         m.cost += m.i_ref_cost;
+         i_halfpel_thresh += m.i_ref_cost;
+ 
++        /* 3D same-eye reference test: for interleaved L,R,L,R, ref 1 is the
++         * SAME eye (2-back) and gives ~7.5x smaller, temporally-stable residual.
++         * The default cost model prefers ref 0 (opposite eye + disparity MV), so
++         * bias strongly toward ref 1 when MOBI_FORCEREF is set, to validate the
++         * fix. */
++        if( getenv("MOBI_FORCEREF") && i_ref >= 1 )
++            m.cost -= 1000000;
++
+         if( m.cost < a->l0.me16x16.cost )
+             h->mc.memcpy_aligned( &a->l0.me16x16, &m, sizeof(x264_me_t) );
+     }
+diff --git a/encoder/cavlc.c b/encoder/cavlc.c
+index be6b0cd..651ef03 100644
+--- a/encoder/cavlc.c
++++ b/encoder/cavlc.c
+@@ -1113,6 +1113,7 @@ static void mobi_encode_p_partition(x264_t *h, int idx, int width, int height, i
+ 	else
+ 	{
+ 		int ref = h->mb.cache.ref[0][x264_scan8[0] + idx];
++		if( getenv("MOBI_REFCNT") ) { static int r[8]={0},t=0; if(ref>=0&&ref<8)r[ref]++; if(++t%20000==0) fprintf(stderr,"[REFCNT] ref0=%d ref1=%d ref2+=%d\n",r[0],r[1],r[2]+r[3]+r[4]); }
+ 		int mvx = h->mb.cache.mv[0][x264_scan8[0] + idx][0] >> 1;
+ 		int mvy = h->mb.cache.mv[0][x264_scan8[0] + idx][1] >> 1;
+ 		int dx = mvx - px;
 diff --git a/encoder/encoder.c b/encoder/encoder.c
-index c00dcf6..4ea9b95 100644
+index c00dcf6..90423b3 100644
 --- a/encoder/encoder.c
 +++ b/encoder/encoder.c
-@@ -1220,12 +1220,17 @@ static int validate_parameters( x264_t *h, int b_open )
+@@ -1220,24 +1220,38 @@ static int validate_parameters( x264_t *h, int b_open )
      h->param.analyse.intra &= X264_ANALYSE_I4x4|X264_ANALYSE_I8x8;
      if( !(h->param.analyse.inter & X264_ANALYSE_PSUB16x16) )
          h->param.analyse.inter &= ~X264_ANALYSE_PSUB8x8;
@@ -23,9 +54,66 @@ index c00dcf6..4ea9b95 100644
 +        h->param.analyse.b_transform_8x8 = getenv("MOBI_8X8") ? 1 : 0;
          h->param.b_deblocking_filter = 0;
          h->param.i_bframe = 0;
-         /* Reference only the immediately previous frame.  The Mobiclip P-frame
+-        /* Reference only the immediately previous frame.  The Mobiclip P-frame
+-         * ref-selection (FRAME0..FRAME4 / sidx wrap) is only validated for the
+-         * single-reference case so far; multi-ref desyncs the decoder. */
+-        h->param.i_frame_reference = 1;
+-        /* Force 16x16-only inter partitions.  The H_SPLIT/V_SPLIT sub-partition
+-         * MV coding does not yet round-trip against the decoder; 16x16 P_L0 /
+-         * P_SKIP uses the simple single-MV path which does.
+-         * Keep I4x4/I8x8 intra flags so x264 doesn't fall back to I16x16,
+-         * which the Mobiclip encoder does not support. */
+-        h->param.analyse.inter &= X264_ANALYSE_I4x4|X264_ANALYSE_I8x8;
++        /* Reference frames.  For frame-interleaved 3D (L,R,L,R) the immediately
++         * previous frame is the OPPOSITE eye, so single-ref codes the full
++         * stereo parallax as residual every frame (~7.5x more than needed) —
++         * the crawling background noise and most of the bitrate gap vs the
++         * official encoder.  Allowing 2 refs lets ME pick the SAME-eye frame
++         * (2-back).  cavlc already maps ref[0]->FRAME0..FRAME4.  Env-gated
++         * (MOBI_REF) while we validate the multi-ref round-trip. */
++        h->param.i_frame_reference = getenv("MOBI_REF") ? atoi(getenv("MOBI_REF")) : 1;
++        if( h->param.i_frame_reference < 1 ) h->param.i_frame_reference = 1;
++        h->param.i_dpb_size = h->param.i_frame_reference; /* keep enough refs in the buffer */
++        /* Inter partitions.  16x16-only was the safe default (the H_SPLIT/V_SPLIT
++         * sub-partition writer existed but was unvalidated).  MOBI_PSUB enables
++         * sub-partitions (16x8/8x16/8x8 and, with PSUB8x8, down to 4x4) so the
++         * encoder can fit complex motion — the biggest quality lever on motion
++         * content.  Keep I4x4/I8x8 intra flags either way (no I16x16). */
++        if( getenv("MOBI_PSUB") )
++            h->param.analyse.inter |= X264_ANALYSE_I4x4|X264_ANALYSE_I8x8|X264_ANALYSE_PSUB16x16|X264_ANALYSE_PSUB8x8;
++        else
++            h->param.analyse.inter &= X264_ANALYSE_I4x4|X264_ANALYSE_I8x8;
+         /* Sub-pel motion: Mobiclip supports half-pel MC.  The encoder maps
+          * x264's quarter-pel cache.mv to Mobiclip's half-pel MV via >>1 in BOTH
+          * the reconstruction (mobi_motion_compensate) and the bitstream write
+@@ -1289,11 +1303,16 @@ static int validate_parameters( x264_t *h, int b_open )
+     }
+     h->param.analyse.i_trellis = x264_clip3( h->param.analyse.i_trellis, 0, 2 );
+     if( h->param.i_mobiclip )
+-        h->param.analyse.i_trellis = 0;
++        h->param.analyse.i_trellis = getenv("MOBI_TRELLIS") ? atoi(getenv("MOBI_TRELLIS")) : 0;
+     h->param.rc.i_aq_mode = x264_clip3( h->param.rc.i_aq_mode, 0, 3 );
+     h->param.rc.f_aq_strength = x264_clip3f( h->param.rc.f_aq_strength, 0, 3 );
+     if( h->param.rc.f_aq_strength == 0 )
+         h->param.rc.i_aq_mode = 0;
++    if( h->param.i_mobiclip && getenv("MOBI_AQ") )
++    {
++        h->param.rc.i_aq_mode = 1;
++        h->param.rc.f_aq_strength = atof(getenv("MOBI_AQ"));
++    }
+ 
+     if( h->param.i_log_level < X264_LOG_INFO )
+     {
+@@ -2453,6 +2472,7 @@ static inline void reference_build_list( x264_t *h, int i_poc )
+         }
+     }
+ 
++    if( getenv("MOBI_REFDBG") ) { static int c=0; if(++c<=6) fprintf(stderr,"[REF] frame#%d i_ref[0]=%d (i_frame_reference=%d)\n",c,h->i_ref[0],h->param.i_frame_reference); }
+     /* Order reference lists by distance from the current frame. */
+     for( int list = 0; list < 2; list++ )
+     {
 diff --git a/encoder/macroblock.c b/encoder/macroblock.c
-index 96bd436..ff5f074 100644
+index 96bd436..17fc4b4 100644
 --- a/encoder/macroblock.c
 +++ b/encoder/macroblock.c
 @@ -997,6 +997,70 @@ static ALWAYS_INLINE void macroblock_encode_internal( x264_t *h, int plane_count
@@ -99,7 +187,46 @@ index 96bd436..ff5f074 100644
          for( int p = 0; p < plane_count; p++, i_qp = h->mb.i_qp )
          {
              for( int i = (p == 0 && h->mb.i_skip_intra) ? 15 : 0; i < 16; i++ )
-@@ -1093,6 +1157,20 @@ static ALWAYS_INLINE void macroblock_encode_internal( x264_t *h, int plane_count
+@@ -1071,7 +1135,38 @@ static ALWAYS_INLINE void macroblock_encode_internal( x264_t *h, int plane_count
+              * sub-partitioned type while claiming D_16x16 makes the entropy
+              * coder emit syntax the decoder reinterprets, desyncing MV/mode
+              * prediction for following MBs -> horizontal shearing. */
++            if( getenv("MOBI_SADDBG") ) {
++                static int nlo=0,nmid=0,nhi=0,ntot=0;
++                ntot++; if(sad<=512)nlo++; else if(sad<=3000)nmid++; else nhi++;
++                if(ntot%20000==0) fprintf(stderr,"[SAD] n=%d  sad<=512:%d%%  512-3000:%d%%  >3000:%d%%\n",
++                    ntot,nlo*100/ntot,nmid*100/ntot,nhi*100/ntot);
++            }
+             int motion_didnt_help = ( sad <= mc_sad + (mc_sad >> 2) + 256 );
++            /* Stability-first freeze: if the block is near-static vs the
++             * reference (sad <= thr), FREEZE it (zero-MV, no residual) even when
++             * the motion search found a nominally-lower-cost match.  On noisy
++             * near-static backgrounds ME over-fits the source's tiny per-frame
++             * variation, so mc_sad < sad and the old motion_didnt_help gate
++             * fails — the block then gets a fresh spurious MV + residual every
++             * frame, re-quantizing the noise differently each time (the crawling
++             * "sand").  Freezing holds it byte-identical across the GOP like the
++             * official encoder.  Gated by MOBI_FREEZE for A/B testing. */
++            if( getenv("MOBI_FREEZE") && sad <= thr )
++            {
++                b_mobi_skip = 1;
++                h->mb.i_type      = P_L0;
++                h->mb.i_partition = D_16x16;
++                for( int i = 0; i < 4; i++ )
++                    h->mb.i_sub_partition[i] = D_L0_8x8;
++                for( int i = 0; i < 16; i++ )
++                {
++                    int i8 = x264_scan8[0] + (i&3) + (i>>2)*8;
++                    h->mb.cache.mv[0][i8][0] = 0;
++                    h->mb.cache.mv[0][i8][1] = 0;
++                    h->mb.cache.ref[0][i8]   = 0;
++                }
++                motion_didnt_help = 0; /* already handled */
++            }
+             if( motion_didnt_help )
+             {
+                 if( sad <= thr )
+@@ -1093,6 +1188,20 @@ static ALWAYS_INLINE void macroblock_encode_internal( x264_t *h, int plane_count
           * residual reconstructs correctly in the Mobiclip decoder. */
      if( h->param.i_mobiclip )
              mobi_motion_compensate( h );
@@ -120,7 +247,7 @@ index 96bd436..ff5f074 100644
  #endif
  
          if( h->mb.b_lossless )
-@@ -1127,6 +1205,47 @@ static ALWAYS_INLINE void macroblock_encode_internal( x264_t *h, int plane_count
+@@ -1127,6 +1236,47 @@ static ALWAYS_INLINE void macroblock_encode_internal( x264_t *h, int plane_count
              for( int p = 0; p < plane_count; p++ )
                  CLEAR_16x16_NNZ( p );
          }
