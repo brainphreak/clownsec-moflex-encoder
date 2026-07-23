@@ -222,3 +222,22 @@ MOBI_RC=1 MOBI_8X8=1 MOBI_PSUB=1 MOBI_SUBME=6 MOBI_DZ=3 \
 Also noted: official-player-only "underwater edges" reported on v4 (not present in our
 decoder's output or our player) — suspected official-decoder divergence on new syntax;
 isolation files (NOsubparts / NO8x8) prepared for on-device A/B.
+
+## RC lambda fix (v6) + state snapshot (2026-07-23)
+
+- **v5 RC files were noisy at any bitrate** (user: "full of noise" even at 2400k). Cause:
+  in RC mode the header QP equaled the x264 QP, so lambda/mode decisions ran ~6 QP too
+  coarse for the true mobi quantizer coarseness. Legacy mode's accidental pairing
+  (lambda@22 with header 28) was the correct match all along.
+- **Fix**: `mobi_shift()` RC branch now maps header = qp+6 (shift = qp/6-1); qp_max
+  clamped to 33. Validated: RC qp22 reproduces legacy qyx2/qp22 within 0.01% bitrate
+  (identical decisions; residual byte-diff is rounding noise).
+- QP trace instrumentation added (`MOBI_QPDBG=1` prints per-frame type+QP). 2-pass QP
+  is smooth (mean |dQP| 0.04) — no oscillation.
+- v6 files delivered (1700k avg QP≈29.5→header≈35, 2400k avg QP≈26→header≈32; targets
+  hit exactly). PENDING: user verdict + v5-vs-v6 PSNR A/B (interrupted).
+- **Lesson recorded twice now: only compare same-window numbers.** The 55-85s slice costs
+  ~2x the 2-min average (2980 vs 1677 kb/s at the same QP) — two false alarms came from
+  cross-window comparisons.
+
+See docs/STATUS.md for the resume-here summary and plan of action.

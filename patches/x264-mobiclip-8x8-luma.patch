@@ -30,25 +30,27 @@ index be6b0cd..651ef03 100644
  		int mvy = h->mb.cache.mv[0][x264_scan8[0] + idx][1] >> 1;
  		int dx = mvx - px;
 diff --git a/encoder/encoder.c b/encoder/encoder.c
-index c00dcf6..30f5cd3 100644
+index c00dcf6..768f6fb 100644
 --- a/encoder/encoder.c
 +++ b/encoder/encoder.c
-@@ -230,7 +230,7 @@ static void slice_header_write( x264_t *h, bs_t *s, x264_slice_header_t *sh, int
+@@ -230,7 +230,8 @@ static void slice_header_write( x264_t *h, bs_t *s, x264_slice_header_t *sh, int
              //dct coef encoding table to use: 1 for I-frames
              bs_write1(s, 1);
              //qp
 -            bs_write(s, 6, (sh->i_qp % 6) + 12 + 6*mobi_qyx(h));
 +            bs_write(s, 6, (sh->i_qp % 6) + 12 + 6*mobi_shift(h, sh->i_qp));
++            if( getenv("MOBI_QPDBG") ) fprintf(stderr, "[QP] I %d\n", sh->i_qp);
          }
          else
          {
-@@ -239,11 +239,11 @@ static void slice_header_write( x264_t *h, bs_t *s, x264_slice_header_t *sh, int
+@@ -239,11 +240,12 @@ static void slice_header_write( x264_t *h, bs_t *s, x264_slice_header_t *sh, int
              x264_mobiclip_reset_pre(h);
              bs_write1(s, 0);
              //qp delta
 -            int cur_hqp = (sh->i_qp % 6) + 12 + 6*mobi_qyx(h);
 +            int cur_hqp = (sh->i_qp % 6) + 12 + 6*mobi_shift(h, sh->i_qp);
              bs_write_se(s, cur_hqp - h->i_mobi_old_qp);
++            if( getenv("MOBI_QPDBG") ) fprintf(stderr, "[QP] P %d\n", sh->i_qp);
          }
          {
 -            int hqp = (sh->i_qp % 6) + 12 + 6*mobi_qyx(h);
@@ -56,7 +58,7 @@ index c00dcf6..30f5cd3 100644
              h->i_mobi_old_qp = hqp;
          }
          return;
-@@ -1220,24 +1220,47 @@ static int validate_parameters( x264_t *h, int b_open )
+@@ -1220,24 +1222,47 @@ static int validate_parameters( x264_t *h, int b_open )
      h->param.analyse.intra &= X264_ANALYSE_I4x4|X264_ANALYSE_I8x8;
      if( !(h->param.analyse.inter & X264_ANALYSE_PSUB16x16) )
          h->param.analyse.inter &= ~X264_ANALYSE_PSUB8x8;
@@ -118,7 +120,7 @@ index c00dcf6..30f5cd3 100644
          /* Sub-pel motion: Mobiclip supports half-pel MC.  The encoder maps
           * x264's quarter-pel cache.mv to Mobiclip's half-pel MV via >>1 in BOTH
           * the reconstruction (mobi_motion_compensate) and the bitstream write
-@@ -1277,6 +1300,18 @@ static int validate_parameters( x264_t *h, int b_open )
+@@ -1277,6 +1302,19 @@ static int validate_parameters( x264_t *h, int b_open )
          h->param.rc.i_qp_min = X264_MAX(h->param.rc.i_qp_min, 12);
          h->param.rc.i_qp_max = X264_MIN(h->param.rc.i_qp_max, 39);
          h->param.rc.f_rf_constant = X264_MIN(h->param.rc.f_rf_constant, 39);
@@ -129,6 +131,7 @@ index c00dcf6..30f5cd3 100644
 +         * the decoder — force them off and keep QP constant within a frame. */
 +        if( getenv("MOBI_RC") )
 +        {
++            h->param.rc.i_qp_max = X264_MIN(h->param.rc.i_qp_max, 33); /* header = qp+6 <= 39 */
 +            h->param.rc.b_mb_tree = 0;
 +            h->param.rc.i_aq_mode = 0;
 +            h->param.rc.i_vbv_max_bitrate = 0;
@@ -137,7 +140,7 @@ index c00dcf6..30f5cd3 100644
      }
      /* CABAC init/encode is disabled (commented out) in this build; force
       * CAVLC so the PPS entropy_coding_mode_flag matches the actual encoding. */
-@@ -1289,11 +1324,16 @@ static int validate_parameters( x264_t *h, int b_open )
+@@ -1289,11 +1327,16 @@ static int validate_parameters( x264_t *h, int b_open )
      }
      h->param.analyse.i_trellis = x264_clip3( h->param.analyse.i_trellis, 0, 2 );
      if( h->param.i_mobiclip )
@@ -155,7 +158,7 @@ index c00dcf6..30f5cd3 100644
  
      if( h->param.i_log_level < X264_LOG_INFO )
      {
-@@ -2453,6 +2493,7 @@ static inline void reference_build_list( x264_t *h, int i_poc )
+@@ -2453,6 +2496,7 @@ static inline void reference_build_list( x264_t *h, int i_poc )
          }
      }
  
@@ -356,10 +359,10 @@ index 96bd436..7ac4ac8 100644
          {
              /* Inter luma residual.  x264's standard quant_4x4x4 + dequant_4x4 +
 diff --git a/encoder/macroblock.h b/encoder/macroblock.h
-index 7b84bd0..2b9ccd4 100644
+index 7b84bd0..e7e3029 100644
 --- a/encoder/macroblock.h
 +++ b/encoder/macroblock.h
-@@ -81,6 +81,25 @@ static ALWAYS_INLINE int mobi_qyx( x264_t *h )
+@@ -81,6 +81,31 @@ static ALWAYS_INLINE int mobi_qyx( x264_t *h )
      if( v == -1 ) { const char *e = getenv("MOBI_QYX"); v = e ? atoi(e) : 1; if( v < 0 ) v = 0; }
      return v;
  }
@@ -377,7 +380,13 @@ index 7b84bd0..2b9ccd4 100644
 +    if( rc < 0 ) rc = getenv("MOBI_RC") != NULL;
 +    if( rc )
 +    {
-+        int s = qp/6 - 2;
++        /* Header QP = qp + 6 (the +6 leaves qp%6 — the sub-step — unchanged
++         * and just bumps the shift by one).  The mobi quantizer at a given
++         * header QP is ~one octave coarser than H.264's at the same number,
++         * so x264's lambda/mode decisions must run at qp ≈ header-6 to be
++         * correctly matched — this offset reproduces exactly the (empirically
++         * good) legacy pairing: legacy qyx2/qp22 == RC qp22 == header 28. */
++        int s = qp/6 - 1;
 +        return s < 0 ? 0 : s;
 +    }
 +    return mobi_qyx( h );
@@ -385,7 +394,7 @@ index 7b84bd0..2b9ccd4 100644
  /* Rounding offset for quantization.  level = (coef + off)/step, so the
   * threshold to reach level 1 is (step - off).  Round-to-nearest uses off =
   * step/2 (threshold step/2).  For INTER residual we instead use a deadzone
-@@ -103,7 +122,7 @@ static ALWAYS_INLINE int mobi_round_off( x264_t *h, int step, int b_intra )
+@@ -103,7 +128,7 @@ static ALWAYS_INLINE int mobi_round_off( x264_t *h, int step, int b_intra )
  static ALWAYS_INLINE int mobi_quant_4x4( x264_t *h, dctcoef dct[16], int qp, int b_intra )
  {
      int qx = qp % 6;
@@ -394,7 +403,7 @@ index 7b84bd0..2b9ccd4 100644
      int nz = 0;
      for( int zz = 0; zz < 16; zz++ )
      {
-@@ -129,7 +148,7 @@ static ALWAYS_INLINE int mobi_quant_4x4( x264_t *h, dctcoef dct[16], int qp, int
+@@ -129,7 +154,7 @@ static ALWAYS_INLINE int mobi_quant_4x4( x264_t *h, dctcoef dct[16], int qp, int
  static ALWAYS_INLINE int mobi_quant_8x8( x264_t *h, dctcoef dct[64], int qp, int b_intra )
  {
      int qx = qp % 6;
@@ -403,7 +412,7 @@ index 7b84bd0..2b9ccd4 100644
      int nz = 0;
      for( int zz = 0; zz < 64; zz++ )
      {
-@@ -431,6 +450,129 @@ static void mobi_predict_4x4( x264_t *h, pixel *p_dst, int idx, int pmode )
+@@ -431,6 +456,129 @@ static void mobi_predict_4x4( x264_t *h, pixel *p_dst, int idx, int pmode )
  }
  #undef MPG
  
@@ -533,7 +542,7 @@ index 7b84bd0..2b9ccd4 100644
  /* Mobiclip chroma 8x8 prediction, matching the decoder's predict_intra(size=8)
   * for the only modes the chroma-mode fix table can emit: 0=V, 1=H, 3=DC.
   * Reads reconstructed neighbours from the fdec tile borders (populated by x264
-@@ -609,7 +751,7 @@ static ALWAYS_INLINE void x264_mb_encode_i4x4( x264_t *h, int p, int idx, int i_
+@@ -609,7 +757,7 @@ static ALWAYS_INLINE void x264_mb_encode_i4x4( x264_t *h, int p, int idx, int i_
               * Forward quant used unshifted mobi_q4[qx], so level=16R/step.
               * Here: level * (step<<2) >> 6 = 16R * 4 / 64 = R. */
              for( int zz = 0; zz < 16; zz++ )
