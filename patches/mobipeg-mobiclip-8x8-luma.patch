@@ -1,8 +1,20 @@
 diff --git a/libavcodec/libx264.c b/libavcodec/libx264.c
-index 9a625c7..7544dfe 100644
+index 9a625c7..8bfc639 100644
 --- a/libavcodec/libx264.c
 +++ b/libavcodec/libx264.c
-@@ -1296,10 +1296,16 @@ static av_cold int X264_init(AVCodecContext *avctx)
+@@ -1170,7 +1170,10 @@ static av_cold int X264_init(AVCodecContext *avctx)
+         } else if (x4->cqp >= 0) {
+             x4->params.rc.i_rc_method   = X264_RC_CQP;
+             x4->params.rc.i_qp_constant = x4->cqp;
+-        } else if (x4->i_mobiclip) {
++        } else if (x4->i_mobiclip && avctx->bit_rate <= 0) {
++            /* Default to CQP 18 only when no bitrate target was given —
++             * with -b:v the ABR rate control set above must survive
++             * (requires MOBI_RC for the monotonic QP scale). */
+             x4->params.rc.i_rc_method   = X264_RC_CQP;
+             x4->params.rc.i_qp_constant = 18;
+         }
+@@ -1296,10 +1299,16 @@ static av_cold int X264_init(AVCodecContext *avctx)
      if (x4->mixed_refs >= 0)
          x4->params.analyse.b_mixed_references = x4->mixed_refs;
      if (x4->i_mobiclip) {

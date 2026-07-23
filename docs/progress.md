@@ -188,3 +188,37 @@ mismatch at the smallest partition sizes; not debugged further since the level i
 near-worthless for bitrate anyway).
 
 Recommended config unchanged except semantics: `MOBI_8X8=1 MOBI_PSUB=1 MOBI_SUBME=6 MOBI_DZ=3`.
+
+## Rate control (ABR + 2-pass) — WORKING (2026-07-22)
+
+The last structural gap vs the official encoder. Three pieces:
+
+1. **Monotonic QP scale (`MOBI_RC=1`)**: the legacy QP scale WRAPS every 6 steps
+   (quant shift fixed by -mobi_qyx, qp only picks the sub-step qp%6) — unusable for RC.
+   New `mobi_shift(h, qp)` derives the shift from qp/6-2 exactly as the decoder derives
+   it from the header QP, giving one monotonic scale qp 12..39. The frame-header write
+   `(qp%6)+12+6*shift` then reduces to plain qp. Applied consistently at all quant,
+   dequant, and header sites; verified strictly-monotonic bitrate over qp 18..30 and
+   bit-exact decode.
+2. **Per-frame RC must stay per-frame**: the mobi header carries only a per-frame QP
+   (I absolute, P delta), so mb_tree / AQ / VBV row-adaptation would desync — forced off
+   under MOBI_RC.
+3. **Wrapper fix**: libx264.c unconditionally overrode rc to CQP 18 for mobiclip,
+   clobbering the ABR that -b:v had set. Now only defaults to CQP when no bitrate given.
+
+**Verified**: `-b:v 1500k` → 1459 (1-pass ABR) / 1498 (2-pass), `-b:v 3000k` → 2910;
+per-frame QP varies (avg ~27 at 1500k); **bit-exact** with varying header QP deltas.
+At matched average bitrate, 2-pass ≈ +0.35 dB mean over CQP; worst-scene p5 PSNR is
+lower by design (complexity-weighted allocation, standard qcompress behavior).
+
+**Usage** (2-pass, official-style):
+```
+MOBI_RC=1 MOBI_8X8=1 MOBI_PSUB=1 MOBI_SUBME=6 MOBI_DZ=3 \
+  ffmpeg ... -c:v mobiclip -b:v 1200k -g 480 -pass 1 -passlogfile L -f null /dev/null
+  ffmpeg ... -c:v mobiclip -b:v 1200k -g 480 -pass 2 -passlogfile L out.moflex
+```
+`-mobi_qyx` is ignored under MOBI_RC (QP carries the full scale).
+
+Also noted: official-player-only "underwater edges" reported on v4 (not present in our
+decoder's output or our player) — suspected official-decoder divergence on new syntax;
+isolation files (NOsubparts / NO8x8) prepared for on-device A/B.
