@@ -88,9 +88,25 @@ Losslessly joins independently-encoded `.moflex` segments into one file.
 
 Moflex is a chain of fixed-size blocks; periodic **sync blocks** (magic `0x4C32`)
 carry an 8-byte big-endian microsecond timestamp. The combiner copies every block
-**verbatim** (video *and* audio preserved bit-exact) and rewrites **only** the sync
-timestamps so each segment continues after the previous. No re-muxing ⇒ audio is
+**verbatim** (video *and* audio preserved bit-exact) and rewrites only the container
+bookkeeping so each segment continues after the previous. No re-muxing ⇒ audio is
 never touched.
+
+The combiner rewrites four pieces of container bookkeeping — the last three are
+**validated by the official 3DS player** but ignored by FFmpeg-family demuxers
+(details in `docs/moflex-format.md`):
+
+1. **Sync timestamp** (bytes 4–11 of each sync block) — rebased so segments run
+   continuously.
+2. **Timestamp checksum** (bytes 2–3) — CRC-16 poly `0x0001` ^ `0xAAAA` over the ts
+   bytes; a mismatch hangs the official player at open.
+3. **Group continuity counter** (upper bits of every block's flags byte, +4 per sync
+   group) — shifted so appended segments continue the sequence; a break stops
+   playback at the seam.
+4. **Stream-1 seek index** (head of the file: entry count, total frames, duration µs,
+   and per-keyframe seek entries) — merged in place with full-movie totals and the
+   union of all segments' rebased seek points; the official player takes the movie
+   duration from this and will not play past what it covers.
 
 ```
 python3 tools/moflex_combine.py combine out.moflex seg1.moflex seg2.moflex [...]
@@ -104,6 +120,7 @@ python3 tools/moflex_combine.py combine out.moflex seg1.moflex seg2.moflex [...]
 | combine two independent files | durations add correctly, audio + video fully preserved, clean block chain |
 | mobipeg-encoded source (44.1 kHz, 4 KB blocks) | ✅ |
 | Nintendo-encoded source (48 kHz, 2 KB blocks, 12 min) | ✅ audio bit-identical over 744 s |
+| two full-length discs (1.2 GB + 0.8 GB, 2:30:51) in the **official player** | ✅ opens, plays through the seam, full duration shown, seeking intact (2026-07-26) |
 
 ## Status / roadmap
 
@@ -112,6 +129,10 @@ python3 tools/moflex_combine.py combine out.moflex seg1.moflex seg2.moflex [...]
 - [x] **On-device validation** — a combined file (two independently-encoded 3D clips
       joined) plays clean on hardware: audio synced across the seam, 3D intact, one
       continuous file. Confirmed 2026-07-21.
+- [x] **Official-player validation** — a two-disc feature (2:30:51) combined from
+      independent encodes plays fully in the official player: timestamp checksum,
+      group continuity counter, and merged seek index all accepted. Confirmed
+      2026-07-26.
 - [x] **Source splitter** (`moflex_split.py`) — lossless keyframe-aligned cuts of the
       full-SBS/over-under source; frame-exact. Pair-safe because every source frame
       already holds both eyes.
