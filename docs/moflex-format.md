@@ -11,8 +11,8 @@ in Nintendo-encoded files, 4096 in mobipeg-encoded ones). Two kinds:
 ```
 offset  size  field
 0       2     magic 0x4C32
-2       2     (skipped by the demuxer)
-4       8     timestamp, big-endian microseconds     ← the ONLY thing combine rewrites
+2       2     timestamp checksum, big-endian (see below)
+4       8     timestamp, big-endian microseconds
 12      2     block size − 1  (block length in bytes = value + 1)
 14      …     stream-descriptor list, terminated by a type-0 entry
         1     flags byte
@@ -21,6 +21,24 @@ offset  size  field
 
 Sync blocks appear roughly once per second of content. The timestamp updates **only**
 here; between syncs the timestamp is implicitly the last sync's.
+
+**Timestamp checksum (bytes 2–3).** A 16-bit check over the 8 timestamp bytes:
+
+```python
+def sync_check(ts_bytes):          # bytes [4:12] of the sync block
+    crc = 0
+    for b in ts_bytes:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x0001) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc ^ 0xAAAA
+```
+
+i.e. a CRC-16 with polynomial `0x0001` (a bare shift/feedback LFSR), init 0, XOR-out
+`0xAAAA`. Verified against 10 031/10 031 sync blocks of Nintendo-encoder output.
+FFmpeg's demuxer skips these bytes, but the **official 3DS player validates them and
+hangs on the first mismatching block** — anything that rewrites a sync timestamp
+(combining, retiming) must recompute this field, and any encoder must emit it.
 
 ### Non-sync block — does **not** start with `0x4C32`
 

@@ -7,11 +7,26 @@ Moflex is a chain of 4KB blocks; periodic SYNC blocks (magic 0x4C32) carry an
 segment continues after the previous. No re-muxing, so audio is never truncated
 (unlike ffmpeg -c copy on moflex, which drops most audio on 3D interleave).
 
+Sync bytes [2:4] are a CHECKSUM of the timestamp: a poly-0x0001 LFSR-CRC over the
+8 ts bytes, XOR 0xAAAA. The OFFICIAL player validates it on every sync (ours does
+not) -- rewriting a timestamp without recomputing it makes the official player
+hang on the first block. Verified against 10031/10031 sync blocks of real
+official-encoder output.
+
 Usage:
   moflex_combine.py combine out.moflex seg1.moflex seg2.moflex [seg3 ...]
   moflex_combine.py split in.moflex <byte_offset> A.moflex B.moflex   # test helper
 """
 import sys
+
+def sync_check(ts_bytes):
+    """bytes [2:4] of a sync block: LFSR(poly 0x0001) CRC over the 8 ts bytes, ^ 0xAAAA."""
+    crc = 0
+    for b in ts_bytes:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x0001) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc ^ 0xAAAA
 
 def walk_syncs(data):
     """Return [[pos, ts], ...] for every SYNC block; validates the block chain reaches EOF."""
@@ -36,7 +51,9 @@ def combine(out, files):
         base = syncs[0][1]; maxnew = 0
         for s in syncs:                                          # rebase each sync ts
             newts = (s[1] - base) + offset
-            data[s[0] + 4:s[0] + 12] = newts.to_bytes(8, 'big')
+            tsb = newts.to_bytes(8, 'big')
+            data[s[0] + 4:s[0] + 12] = tsb
+            data[s[0] + 2:s[0] + 4] = sync_check(tsb).to_bytes(2, 'big')   # official player validates!
             maxnew = max(maxnew, newts)
         result += data
         interval = (syncs[-1][1] - syncs[-2][1]) if len(syncs) >= 2 and syncs[-1][1] != syncs[-2][1] else 1001001
