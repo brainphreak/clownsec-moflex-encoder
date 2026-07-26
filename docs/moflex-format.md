@@ -55,6 +55,29 @@ segments end at the seam. Joining segments requires shifting each appended segme
 counter to continue +4 from the previous segment's last group (internal +4/+8 deltas
 are preserved by a constant shift).
 
+### Stream 1: the seek index (why the official player knows the duration)
+
+The "data" stream (descriptor type 4, stream index 1) is not empty: it carries ONE
+frame, split into ~2 KB chunks filling the first blocks of the file. Little-endian:
+
+```
+u32   entry_count
+u32   total_video_frames          (both eyes; = duration x 2 x fps for 3D)
+u64   duration_us                 ← what the official player displays as movie length
+then entry_count x 24-byte entries:
+u64   video frame number
+u64   timestamp_us                (0-based; sync ts − 1)
+u64   byte offset of a sync block (a seek point, ~every 4-5 s)
+```
+
+The official player takes the movie duration from this header and seeks via the
+entries; it will not play past what the index covers. FFmpeg ignores stream 1
+entirely. When combining, the index frame's byte size cannot change (it would shift
+every block behind it), so the merged index is rewritten IN PLACE: segment 1's blob
+gets header totals for the whole movie plus the union of all segments' (rebased)
+entries, downsampled evenly to the original entry count; later segments' embedded
+blobs are rewritten with globally-rebased values.
+
 ### Walking the chain
 
 Start at offset 0 (always a sync). At each block: if it begins with `0x4C32`, read a new
