@@ -44,6 +44,17 @@ hangs on the first mismatching block** — anything that rewrites a sync timesta
 
 Just `flags byte` + chunk data. Reuses the size and timestamp of the last sync block.
 
+**Flags byte = group continuity counter.** Every block (sync blocks after their
+descriptor list, non-sync blocks at offset 0) carries a flags byte whose upper 6 bits
+are a rolling GROUP COUNTER: +4 (byte value) per sync group, mod 256, occasionally +8,
+stamped identically on every block of the group. The low 2 bits are demuxer flags
+(bit 0 = block-advance mode, bit 1 = two extra bytes follow) and are 0 in
+Nintendo-encoder output. FFmpeg ignores the counter; the **official player checks
+continuity and stops playback at the first discontinuity** — so naively concatenated
+segments end at the seam. Joining segments requires shifting each appended segment's
+counter to continue +4 from the previous segment's last group (internal +4/+8 deltas
+are preserved by a constant shift).
+
 ### Walking the chain
 
 Start at offset 0 (always a sync). At each block: if it begins with `0x4C32`, read a new
