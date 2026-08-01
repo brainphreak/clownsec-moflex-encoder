@@ -165,17 +165,27 @@ def adpcm_packets(pcm, channels, rate):
 
 # ---------------- parse the source file into groups of packets ----------------
 
+class Frame:
+    __slots__ = ('si', 'payload', 'efbits', 'si_bits')
+    def __init__(self, si, payload, efbits, si_bits):
+        self.si = si; self.payload = payload
+        self.efbits = efbits          # the raw bits between the endframe flag and the size field
+        self.si_bits = si_bits        # unary width the source used for this stream index
+
 class Group:
-    __slots__ = ('ts', 'counter', 'chunks')           # chunks: list of raw (header+payload) OR
-    def __init__(self, ts, counter):                  #   ('pkt', si, endframe, raw_bytes, payload_span)
-        self.ts = ts; self.counter = counter; self.chunks = []
+    __slots__ = ('ts', 'flags', 'frames', 'desc')
+    def __init__(self, ts, flags, desc):
+        self.ts = ts; self.flags = flags; self.frames = []; self.desc = desc
 
 def parse(data):
+    """Assemble the file into GROUPS of complete FRAMES (the original chunk boundaries are
+    a property of block tiling, not of the content -- the packer re-splits to fill blocks
+    exactly like the source muxer, which is what keeps a no-op repack byte-identical)."""
     n = len(data); pos = 0; size = None
     groups = []; desc = None; blocksize = None
-    idx_chunks = []                                    # (group#, chunk#) of seek-index chunks
     max_si = 0
     g = None
+    acc = {}                                           # si -> (payload bytearray, group#)
     while pos + 2 <= n:
         if data[pos] == 0x4C and data[pos + 1] == 0x32:
             ts = int.from_bytes(data[pos + 4:pos + 12], 'big')
@@ -191,7 +201,7 @@ def parse(data):
                     break
             if desc is None:
                 desc = bytes(data[dstart:dend])
-            g = Group(ts, data[i] & 0xFC)
+            g = Group(ts, data[i], bytes(data[dstart:dend]))   # descriptors VARY per sync (tb quirk)
             groups.append(g)
             flags = data[i]; ci = i + 1
             if flags & 2:
@@ -203,31 +213,54 @@ def parse(data):
         end = pos + size
         while ci < end and data[ci] != 0:
             br = BitReader(data, ci)
-            bits = br.poplen(); si = br.popn(bits); ef = br.pop()
+            si_bits = br.poplen(); si = br.popn(si_bits); ef = br.pop()
+            efbits = []
             if ef:
+                mark = br.bp
                 b = br.poplen(); br.popn(b); br.pop()
                 b2 = br.poplen(); br.popn(b2 * 2 + 26)
+                efbits = [br.d[br.start + (k >> 3)] >> (7 - (k & 7)) & 1 for k in range(mark, br.bp)]
             pkt = br.popn(13) + 1
             po = br.after()
-            raw = bytes(data[ci:po + pkt])
-            if si == 1:
-                idx_chunks.append((len(groups) - 1, len(g.chunks), po - ci, pkt))
-            g.chunks.append((si, raw))
+            payload = data[ci + (po - ci):po + pkt][:]  # payload bytes only
+            if si not in acc:
+                acc[si] = (bytearray(), len(groups) - 1)
+            acc[si][0].extend(data[po:po + pkt])
+            if ef:
+                buf, gi0 = acc.pop(si)
+                groups[gi0].frames.append(Frame(si, bytes(buf), efbits, si_bits))
             max_si = max(max_si, si)
             ci = po + pkt
         pos += size
     if pos != n:
         raise ValueError('block chain did not reach EOF — corrupt/unsupported')
-    return groups, desc, blocksize, idx_chunks, max_si
+    return groups, desc, blocksize, max_si
 
 # ---------------- repack groups into a block stream ----------------
 
-def pack(groups, desc, blocksize):
-    """Emit the block stream; returns (bytes, sync_offsets {group# -> file offset},
-    payload_map: for every chunk, list of (file_offset_of_payload_start))."""
+def make_efbits(efv, data_frame=0):
+    """[X-len=1][X=0][bit][b2-len=1][28-bit efv] -- audio uses bit=0, head data frames bit=1."""
+    bits = [1, 0, 1 if data_frame else 0, 1]
+    for k in range(27, -1, -1):
+        bits.append((efv >> k) & 1)
+    return bits
+
+def frame_chunk(si, si_bits, endframe, efbits, size):
+    w = BitWriter()
+    w.put_len(si_bits); w.put(si, si_bits)
+    w.put(1 if endframe else 0, 1)
+    if endframe:
+        for b in efbits:
+            w.bits.append(b)
+    w.put(size - 1, 13)
+    return w.bytes()
+
+def pack(groups, extra_desc, blocksize):
+    """Emit the block stream, re-splitting每 frame to FILL blocks exactly (source-muxer
+    tiling). Returns (bytes, sync_offsets, payload positions per (group#, frame#))."""
     out = bytearray()
     sync_off = {}
-    chunk_pos = {}                                     # (g#, c#) -> payload file offset
+    frame_pos = {}                                     # (g#, f#) -> [(file_off, nbytes), ...]
     for gi, g in enumerate(groups):
         sync_off[gi] = len(out)
         tsb = g.ts.to_bytes(8, 'big')
@@ -236,28 +269,35 @@ def pack(groups, desc, blocksize):
         hdr += sync_check(tsb).to_bytes(2, 'big')
         hdr += tsb
         hdr += (blocksize - 1).to_bytes(2, 'big')
-        hdr += desc + b'\x00\x00'                      # descriptor list + type-0 terminator
+        hdr += g.desc + extra_desc + b'\x00\x00'   # each sync keeps ITS OWN descriptor variant
         block = bytearray(hdr)
-        block.append(g.counter)                        # flags byte (low bits 0 in native files)
-        for ci, (si, raw) in enumerate(g.chunks):
-            if len(block) + len(raw) + 1 > blocksize:  # +1: room for the terminator byte
-                block += b'\x00' * (blocksize - len(block))
-                out += block
-                block = bytearray()
-                block.append(g.counter)                # continuation block: flags byte only
-            # payload offset inside the raw chunk = header length
-            br = BitReader(raw, 0)
-            bits = br.poplen(); br.popn(bits); ef = br.pop()
-            if ef:
-                b = br.poplen(); br.popn(b); br.pop()
-                b2 = br.poplen(); br.popn(b2 * 2 + 26)
-            br.popn(13)
-            chunk_pos[(gi, ci)] = len(out) + len(block) + br.after()
-            block += raw
+        block.append(g.flags)
+        for fi, fr in enumerate(g.frames):
+            sent = 0; spans = []
+            hdr_fin  = len(frame_chunk(fr.si, fr.si_bits, 1, fr.efbits, 1))
+            hdr_cont = len(frame_chunk(fr.si, fr.si_bits, 0, [], 1))
+            while sent < len(fr.payload):
+                remaining = len(fr.payload) - sent
+                space = blocksize - len(block)
+                if space >= hdr_fin + remaining and remaining <= 8192:
+                    take, fin, h = remaining, 1, hdr_fin          # frame completes here
+                elif space >= hdr_cont + 1 and remaining >= 2:
+                    take = min(space - hdr_cont, remaining - 1, 8192)   # never finish on a cont
+                    fin, h = 0, hdr_cont
+                else:                                             # no useful room -> next block
+                    block += b'\x00' * (blocksize - len(block))
+                    out += block
+                    block = bytearray(); block.append(g.flags)
+                    continue
+                ch = frame_chunk(fr.si, fr.si_bits, fin, fr.efbits if fin else [], take)
+                spans.append((len(out) + len(block) + len(ch), take))
+                block += ch + fr.payload[sent:sent + take]
+                sent += take
+            frame_pos[(gi, fi)] = spans
         if len(block) < blocksize:
             block += b'\x00' * (blocksize - len(block))
         out += block
-    return bytes(out), sync_off, chunk_pos
+    return bytes(out), sync_off, frame_pos
 
 # ---------------- main ----------------
 
@@ -280,33 +320,32 @@ def main():
         else: print('unknown arg', args[i]); sys.exit(1)
 
     data = open(src, 'rb').read()
-    groups, desc, blocksize, idx_chunks, max_si = parse(data)
+    groups, desc, blocksize, max_si = parse(data)
     print(f'  source: {len(data)} B, {len(groups)} sync groups, block {blocksize}, streams<= {max_si}')
 
-    new_desc = bytearray(desc)
+    new_desc = bytearray()                 # ADDED descriptor entries (appended to every sync's own)
     next_si = max_si + 1
 
     if strip:
-        # remove the existing audio stream: its packets AND its descriptor entry. The freed
-        # stream number is NOT reused for safety -- new tracks get fresh indices, and the
-        # official player sees the first audio DESCRIPTOR, which is the one we add.
-        dropped = 0
-        nd = bytearray(); j = 0
+        # remove the existing audio: its frames AND its descriptor entry from EVERY sync
         audio_sis = set()
-        while j < len(new_desc):
-            t, j2 = rvarb(new_desc, j); ss, j3 = rvarb(new_desc, j2)
-            if t == 2:
-                audio_sis.add(new_desc[j3])   # first payload byte of a type-2 entry = stream index
-                j = j3 + ss
-                continue
-            nd += new_desc[j:j3 + ss]
-            j = j3 + ss
-        new_desc = nd
         for g in groups:
-            kept = [(si, raw) for (si, raw) in g.chunks if si not in audio_sis]
-            dropped += len(g.chunks) - len(kept)
-            g.chunks = kept
-        print(f'  stripped existing audio: streams {sorted(audio_sis)}, {dropped} packets removed')
+            nd = bytearray(); j = 0
+            while j < len(g.desc):
+                t, j2 = rvarb(g.desc, j); ss, j3 = rvarb(g.desc, j2)
+                if t == 2:
+                    audio_sis.add(g.desc[j3])
+                    j = j3 + ss
+                    continue
+                nd += g.desc[j:j3 + ss]
+                j = j3 + ss
+            g.desc = bytes(nd)
+        dropped = 0
+        for g in groups:
+            kept = [fr for fr in g.frames if fr.si not in audio_sis]
+            dropped += len(g.frames) - len(kept)
+            g.frames = kept
+        print(f'  stripped existing audio: streams {sorted(audio_sis)}, {dropped} frames removed')
 
     def load_wav(path):
         w = wave.open(path, 'rb')
@@ -315,11 +354,8 @@ def main():
         pcm = list(struct.unpack(f'<{w.getnframes() * chn}h', w.readframes(w.getnframes())))
         w.close()
         if norm:
-            # Peak-normalize to -1 dBFS: scale = target/peak, so the loudest sample lands ON the
-            # target and nothing can exceed it -- clipping is impossible by construction, with
-            # ~10%% headroom left for ADPCM transient overshoot (decoder clamps regardless).
             peak = max(1, max(pcm), -min(pcm))
-            target = 29204                              # -1.0 dBFS
+            target = 29204                              # -1.0 dBFS: scale=target/peak, clip-proof
             if peak != target:
                 sc = target / peak
                 pcm = [int(x * sc) for x in pcm]
@@ -328,9 +364,7 @@ def main():
         return pcm, chn, rate
 
     def interleave(apkts, asi, rate):
-        # Bucket packets per group, then WEAVE them among the group's existing chunks the way
-        # native files do (audio alternates with video). A burst at the group end starved the
-        # official player's audio pre-roll (silent + choppy on hardware).
+        # bucket per group, weave among existing frames (audio alternates with video natively)
         spans = [g.ts for g in groups]
         dur_pkt = PKT_SAMPLES * 1000000 // rate
         per_group = [[] for _ in groups]
@@ -339,51 +373,46 @@ def main():
             t_end = t_us + dur_pkt
             while gi + 1 < len(groups) and spans[gi + 1] <= t_end + 1:
                 gi += 1
-            efv = max(0, t_end - (spans[gi] - 1))       # sync ts is content ts + 1
-            raw = chunk_header(asi, 1, efv, len(payload), 0) + payload
-            per_group[gi].append((asi, raw))
-        for gi, add in enumerate(per_group):
+            efv = max(0, t_end - (spans[gi] - 1))
+            per_group[gi].append(Frame(asi, payload, make_efbits(efv, 0), max(1, asi.bit_length())))
+        for gi2, add in enumerate(per_group):
             if not add:
                 continue
-            old = groups[gi].chunks
+            old = groups[gi2].frames
             if not old:
-                groups[gi].chunks = add
+                groups[gi2].frames = add
                 continue
             step = max(1, len(old) // (len(add) + 1))
             woven = []; ai = 0
-            for k, ch in enumerate(old):
+            for k, fr in enumerate(old):
                 if ai < len(add) and k % step == 0:
                     woven.append(add[ai]); ai += 1
-                woven.append(ch)
+                woven.append(fr)
             woven.extend(add[ai:])
-            groups[gi].chunks = woven
+            groups[gi2].frames = woven
 
-    # ---- added audio stream(s) ----
     if wav_path:
-        pcm, chn, rate = load_wav(wav_path)
-        apkts = adpcm_packets(pcm, chn, rate)
-        if audio_first and max_si == 2:
-            # The file's ONE existing audio stream (si=2) moves to si=3; the new track takes 2.
-            # si 2 ("10") and 3 ("11") are both two bits wide, so retagging is a one-bit patch
-            # at a fixed position: header = [unary len "01"][si bits] -> bit 3 of the first byte.
-            asi = 2; moved = 3; next_si = 4
+        if audio_first and max_si == 2 and not strip:
+            # existing single audio (si=2) moves to si=3; the new track takes 2 (same bit width)
             for g in groups:
-                for k, (si, raw) in enumerate(g.chunks):
-                    if si == 2:
-                        rb = bytearray(raw); rb[0] |= 0x10   # "10"->"11" at bits 2-3 of byte 0
-                        g.chunks[k] = (moved, bytes(rb))
-            # descriptor list: retag the old audio entry's stream index byte 2 -> 3
-            nd = bytearray(); j = 0
-            while j < len(new_desc):
-                t, j2 = rvarb(new_desc, j); ss, j3 = rvarb(new_desc, j2)
-                entry = bytearray(new_desc[j:j3 + ss])
-                if t == 2 and entry[j2 - j] == 2:
-                    entry[j2 - j] = 3
-                nd += entry
-                j = j3 + ss
-            new_desc = nd
+                for fr in g.frames:
+                    if fr.si == 2:
+                        fr.si = 3
+            for g in groups:
+                nd = bytearray(); j = 0
+                while j < len(g.desc):
+                    t, j2 = rvarb(g.desc, j); ss, j3 = rvarb(g.desc, j2)
+                    entry = bytearray(g.desc[j:j3 + ss])
+                    if t == 2 and entry[j3 - j] == 2:
+                        entry[j3 - j] = 3
+                    nd += entry
+                    j = j3 + ss
+                g.desc = bytes(nd)
+            asi = 2; next_si = 4
         else:
             asi = next_si; next_si += 1
+        pcm, chn, rate = load_wav(wav_path)
+        apkts = adpcm_packets(pcm, chn, rate)
         new_desc += bytes([0x02, 0x06, asi, 0x01]) + (rate - 1).to_bytes(3, 'big') + bytes([chn - 1])
         print(f'  audio 1: {len(pcm)//chn} samples @{rate}Hz x{chn} -> {len(apkts)} packets as stream {asi}')
         interleave(apkts, asi, rate)
@@ -396,38 +425,41 @@ def main():
         print(f'  audio 2: {len(pcm2)//chn2} samples @{rate2}Hz x{chn2} -> {len(apkts2)} packets as stream {asi2}')
         interleave(apkts2, asi2, rate2)
 
-    # ---- embedded subtitles: one data-stream frame right after the seek index ----
+    # locate the seek index frame (stream 1) BEFORE any subtitle insertion
+    idx_ref = None
+    for gi, g in enumerate(groups):
+        for fi, fr in enumerate(g.frames):
+            if fr.si == 1:
+                idx_ref = (gi, fi)
+                break
+        if idx_ref:
+            break
+
     if srt_path:
         srt = open(srt_path, 'rb').read()
         ssi = next_si; next_si += 1
         new_desc += bytes([subtype, 0x02, ssi, 0x00])
-        head = groups[idx_chunks[-1][0]] if idx_chunks else groups[0]
-        CH = 1800
-        off = 0
-        while off < len(srt):
-            part = srt[off:off + CH]
-            off += CH
-            last = off >= len(srt)
-            raw = chunk_header(ssi, 1 if last else 0, 1, len(part), 1) + part
-            head.chunks.append((ssi, raw))
-        print(f'  subtitles: {len(srt)} B as stream {ssi} in {(len(srt)+CH-1)//CH} chunks at the head')
+        fr = Frame(ssi, srt, make_efbits(1, 1), max(1, ssi.bit_length()))
+        if idx_ref:                                     # one frame, right after the seek index
+            groups[idx_ref[0]].frames.insert(idx_ref[1] + 1, fr)
+        else:
+            groups[0].frames.insert(0, fr)
+        print(f'  subtitles: {len(srt)} B as ONE frame on stream {ssi} (type {subtype})')
 
-    # ---- repack with the widened descriptor list ----
-    out, sync_off, chunk_pos = pack(groups, bytes(new_desc), blocksize)
+    out, sync_off, frame_pos = pack(groups, bytes(new_desc), blocksize)
     out = bytearray(out)
 
-    # ---- patch the seek index: same entries, offsets remapped to the new block positions ----
-    if idx_chunks:
-        blob = bytearray()
-        for (gi, ci, hlen, plen) in idx_chunks:
-            raw = groups[gi].chunks[ci][1]
-            blob += raw[hlen:hlen + plen]
-        cnt, frames = struct.unpack('<II', blob[0:8])
-        old_syncs = {}                                  # old file offset -> group#
-        pos = 0; size = None; g = -1
-        for gi2, grp in enumerate(groups):
-            pass
-        # rebuild old offset map by re-walking the ORIGINAL file
+    # patch the seek index offsets for the new block positions
+    if idx_ref:
+        blob = bytearray(groups[idx_ref[0]].frames[idx_ref[1] if not (srt_path and False) else idx_ref[1]].payload)
+        # (the index frame object is unchanged by insertion AFTER it, but its position may have
+        #  shifted if audio frames were woven before it -- find it again by stream)
+        for fi, fr in enumerate(groups[idx_ref[0]].frames):
+            if fr.si == 1:
+                idx_ref = (idx_ref[0], fi); blob = bytearray(fr.payload)
+                break
+        cnt, frames_total = struct.unpack('<II', blob[0:8])
+        old_syncs = {}
         pos = 0; size = None; gnum = -1
         while pos + 2 <= len(data):
             if data[pos] == 0x4C and data[pos + 1] == 0x32:
@@ -435,17 +467,19 @@ def main():
                 gnum += 1
                 old_syncs[pos] = gnum
             pos += size
+        patched = 0
         for k in range(cnt):
             o = 16 + 24 * k
             f_, t_, off_ = struct.unpack('<QQQ', blob[o:o + 24])
             if off_ in old_syncs:
                 blob[o + 16:o + 24] = struct.pack('<Q', sync_off[old_syncs[off_]])
-        # scatter the patched blob back into the packed output
+                patched += 1
         w = 0
-        for (gi, ci, hlen, plen) in idx_chunks:
-            p = chunk_pos[(gi, ci)]
-            out[p:p + plen] = blob[w:w + plen]
-            w += plen
+        for (foff, nbytes) in frame_pos[idx_ref]:
+            out[foff:foff + nbytes] = blob[w:w + nbytes]
+            w += nbytes
+        print(f'  seek index: {patched}/{cnt} offsets remapped')
+
     open(dst, 'wb').write(out)
     print(f'wrote {dst}: {len(out)} B ({len(out)-len(data):+} B)')
 
