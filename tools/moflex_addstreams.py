@@ -30,7 +30,8 @@ Usage:
   --normalize          peak-normalize each provided WAV to -1 dBFS (loud, no clipping)
   --trailer-audio x.wav  second language as a TRAILER after the last block (official player
                          never reads it; ours plays it as Audio Track 2)
-  --trailer-srt x.srt    subtitles in the trailer (ours shows them; official ignores)
+  --trailer-srt x.srt    subtitles in the trailer; REPEATABLE for multiple languages
+                         (lang tag from '.eng.srt'-style names; first listed = default)
 
 Hardware-validated design: the official player is STRICT -- any extra in-band stream hangs
 it (data/unknown descriptors) or chokes its demux queue (extra audio: ~1fps, silent). So:
@@ -323,11 +324,16 @@ def main():
         print(__doc__); sys.exit(1)
     src, dst = args[0], args[1]
     wav_path = wav2_path = srt_path = None; audio_first = False; strip = False; norm = False
-    subtype = 4; tr_wav = tr_srt = None; lang_main = lang_alt = None
+    subtype = 4; tr_wav = None; tr_srts = []; lang_main = lang_alt = None
 
     def infer_lang(path):
         import re as _re
         m = _re.search(r'\.([a-z]{2,3})\.(wav|flac)$', path or '', _re.I)
+        return m.group(1).upper()[:3] if m else None
+
+    def infer_lang_ext(path):
+        import re as _re
+        m = _re.search(r'\.([a-z]{2,3})\.(srt)$', path or '', _re.I)
         return m.group(1).upper()[:3] if m else None
     i = 2
     while i < len(args):
@@ -339,7 +345,7 @@ def main():
         elif args[i] == '--normalize': norm = True; i += 1
         elif args[i] == '--subtype': subtype = int(args[i + 1]); i += 2
         elif args[i] == '--trailer-audio': tr_wav = args[i + 1]; i += 2
-        elif args[i] == '--trailer-srt': tr_srt = args[i + 1]; i += 2
+        elif args[i] == '--trailer-srt': tr_srts.append(args[i + 1]); i += 2
         elif args[i] == '--lang': lang_main = args[i + 1][:3].upper(); i += 2
         elif args[i] == '--trailer-lang': lang_alt = args[i + 1][:3].upper(); i += 2
         else: print('unknown arg', args[i]); sys.exit(1)
@@ -507,16 +513,17 @@ def main():
             w += nbytes
         print(f'  seek index: {patched}/{cnt} offsets remapped')
 
-    if tr_wav or tr_srt:
+    if tr_wav or tr_srts:
         payload = bytearray()
         lm = lang_main or infer_lang(wav_path)
         if lm:
             payload += struct.pack('<4sI4s', b'LNG0', 4, lm.encode()[:3].ljust(4, b'\0'))
             print(f'  in-band language tag: {lm}')
-        if tr_srt:
-            srt = open(tr_srt, 'rb').read()
-            payload += struct.pack('<4sI', b'SUB0', len(srt)) + srt
-            print(f'  trailer subs: {len(srt)} B')
+        for ts_path in tr_srts:                       # repeatable: one SUB1 per language
+            srt = open(ts_path, 'rb').read()
+            sl = (infer_lang_ext(ts_path) or 'SUB').encode()[:3].ljust(4, b'\0')
+            payload += struct.pack('<4sI4s', b'SUB1', 4 + len(srt), sl) + srt
+            print(f'  trailer subs [{sl.rstrip(chr(0).encode()).decode()}]: {len(srt)} B')
         if tr_wav:
             pcm, chn, rate = load_wav(tr_wav)
             total = len(pcm) // chn
