@@ -32,6 +32,11 @@ Usage:
                          never reads it; ours plays it as Audio Track 2)
   --trailer-srt x.srt    subtitles in the trailer; REPEATABLE for multiple languages
                          (lang tag from '.eng.srt'-style names; first listed = default)
+  --nfo info.txt         library metadata (key=value lines: title, year, desc, genres,
+                         category, runtime, date) -> 'NFO0' section; the player imports it
+                         so the file needs NO scraping, even offline
+  --art poster.jpg       poster art -> scaled via ffmpeg to the library's 132x188 RGB565
+                         ('ART5' section); imported with the metadata
 
 Hardware-validated design: the official player is STRICT -- any extra in-band stream hangs
 it (data/unknown descriptors) or chokes its demux queue (extra audio: ~1fps, silent). So:
@@ -325,6 +330,7 @@ def main():
     src, dst = args[0], args[1]
     wav_path = wav2_path = srt_path = None; audio_first = False; strip = False; norm = False
     subtype = 4; tr_wav = None; tr_srts = []; lang_main = lang_alt = None
+    nfo_path = art_path = None
 
     def infer_lang(path):
         import re as _re
@@ -348,6 +354,8 @@ def main():
         elif args[i] == '--trailer-srt': tr_srts.append(args[i + 1]); i += 2
         elif args[i] == '--lang': lang_main = args[i + 1][:3].upper(); i += 2
         elif args[i] == '--trailer-lang': lang_alt = args[i + 1][:3].upper(); i += 2
+        elif args[i] == '--nfo': nfo_path = args[i + 1]; i += 2
+        elif args[i] == '--art': art_path = args[i + 1]; i += 2
         else: print('unknown arg', args[i]); sys.exit(1)
 
     data = open(src, 'rb').read()
@@ -513,8 +521,22 @@ def main():
             w += nbytes
         print(f'  seek index: {patched}/{cnt} offsets remapped')
 
-    if tr_wav or tr_srts:
+    if tr_wav or tr_srts or nfo_path or art_path:
         payload = bytearray()
+        if nfo_path:
+            nfo = open(nfo_path, 'rb').read()
+            payload += struct.pack('<4sI', b'NFO0', len(nfo)) + nfo
+            print(f'  library info: {len(nfo)} B')
+        if art_path:
+            import subprocess, tempfile, os as _os
+            tmp = tempfile.mktemp(suffix='.raw')
+            subprocess.run(['ffmpeg', '-y', '-v', 'error', '-i', art_path,
+                            '-vf', 'scale=132:188', '-pix_fmt', 'rgb565le', '-f', 'rawvideo', tmp],
+                           check=True)
+            raw = open(tmp, 'rb').read(); _os.unlink(tmp)
+            assert len(raw) == 132 * 188 * 2, len(raw)
+            payload += struct.pack('<4sIHH', b'ART5', 4 + len(raw), 132, 188) + raw
+            print(f'  poster art: {art_path.split("/")[-1]} -> 132x188 RGB565')
         lm = lang_main or infer_lang(wav_path)
         if lm:
             payload += struct.pack('<4sI4s', b'LNG0', 4, lm.encode()[:3].ljust(4, b'\0'))
