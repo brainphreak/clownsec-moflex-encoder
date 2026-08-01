@@ -267,6 +267,7 @@ def main():
         print(__doc__); sys.exit(1)
     src, dst = args[0], args[1]
     wav_path = wav2_path = srt_path = None; audio_first = False; strip = False; norm = False
+    subtype = 4
     i = 2
     while i < len(args):
         if args[i] == '--audio': wav_path = args[i + 1]; i += 2
@@ -275,6 +276,7 @@ def main():
         elif args[i] == '--audio-first': audio_first = True; i += 1
         elif args[i] == '--strip-audio': strip = True; i += 1
         elif args[i] == '--normalize': norm = True; i += 1
+        elif args[i] == '--subtype': subtype = int(args[i + 1]); i += 2
         else: print('unknown arg', args[i]); sys.exit(1)
 
     data = open(src, 'rb').read()
@@ -326,8 +328,12 @@ def main():
         return pcm, chn, rate
 
     def interleave(apkts, asi, rate):
+        # Bucket packets per group, then WEAVE them among the group's existing chunks the way
+        # native files do (audio alternates with video). A burst at the group end starved the
+        # official player's audio pre-roll (silent + choppy on hardware).
         spans = [g.ts for g in groups]
         dur_pkt = PKT_SAMPLES * 1000000 // rate
+        per_group = [[] for _ in groups]
         gi = 0
         for (t_us, payload) in apkts:
             t_end = t_us + dur_pkt
@@ -335,7 +341,22 @@ def main():
                 gi += 1
             efv = max(0, t_end - (spans[gi] - 1))       # sync ts is content ts + 1
             raw = chunk_header(asi, 1, efv, len(payload), 0) + payload
-            groups[gi].chunks.append((asi, raw))
+            per_group[gi].append((asi, raw))
+        for gi, add in enumerate(per_group):
+            if not add:
+                continue
+            old = groups[gi].chunks
+            if not old:
+                groups[gi].chunks = add
+                continue
+            step = max(1, len(old) // (len(add) + 1))
+            woven = []; ai = 0
+            for k, ch in enumerate(old):
+                if ai < len(add) and k % step == 0:
+                    woven.append(add[ai]); ai += 1
+                woven.append(ch)
+            woven.extend(add[ai:])
+            groups[gi].chunks = woven
 
     # ---- added audio stream(s) ----
     if wav_path:
@@ -379,7 +400,7 @@ def main():
     if srt_path:
         srt = open(srt_path, 'rb').read()
         ssi = next_si; next_si += 1
-        new_desc += bytes([0x04, 0x02, ssi, 0x00])
+        new_desc += bytes([subtype, 0x02, ssi, 0x00])
         head = groups[idx_chunks[-1][0]] if idx_chunks else groups[0]
         CH = 1800
         off = 0
