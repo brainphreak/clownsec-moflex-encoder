@@ -346,6 +346,8 @@ def main():
             dropped += len(g.frames) - len(kept)
             g.frames = kept
         print(f'  stripped existing audio: streams {sorted(audio_sis)}, {dropped} frames removed')
+        if audio_sis:
+            next_si = min(audio_sis)   # replacement takes the freed slot: layout stays native
 
     def load_wav(path):
         w = wave.open(path, 'rb')
