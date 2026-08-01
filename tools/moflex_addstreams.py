@@ -27,7 +27,23 @@ Usage:
                        the encode-pipeline audio is reference only)
   --audio-first        alternative to --strip-audio: keep the existing audio but move
                        it to stream 3 (bit patch); the --audio track takes stream 2
-  --normalize          peak-normalize each provided WAV to -0.2 dBFS (loud, no clipping)
+  --normalize          peak-normalize each provided WAV to -1 dBFS (loud, no clipping)
+  --trailer-audio x.wav  second language as a TRAILER after the last block (official player
+                         never reads it; ours plays it as Audio Track 2)
+  --trailer-srt x.srt    subtitles in the trailer (ours shows them; official ignores)
+
+Hardware-validated design: the official player is STRICT -- any extra in-band stream hangs
+it (data/unknown descriptors) or chokes its demux queue (extra audio: ~1fps, silent). So:
+in-band audio is REPLACED (--strip-audio --audio eng.wav keeps the exact native layout) and
+everything extra lives past the final block:
+
+  [normal moflex blocks][sections...][u64 payload_off][8B magic "CSXTRA01"]
+  section: [4cc][u32 len][data]
+    'SUB0' -> the .srt bytes
+    'AUD1' -> u32 rate, u16 channels, u16 samples/packet (1024), char lang[4] ("JPN"),
+              then FIXED-SIZE ADPCM packets (in-band framing) -> seek = pure arithmetic
+    'LNG0' -> char lang[4]: language of the IN-BAND audio track ("ENG")
+  Languages auto-infer from ".xxx.wav" filenames; --lang / --trailer-lang override.
 """
 import struct
 import sys
@@ -307,7 +323,12 @@ def main():
         print(__doc__); sys.exit(1)
     src, dst = args[0], args[1]
     wav_path = wav2_path = srt_path = None; audio_first = False; strip = False; norm = False
-    subtype = 4
+    subtype = 4; tr_wav = tr_srt = None; lang_main = lang_alt = None
+
+    def infer_lang(path):
+        import re as _re
+        m = _re.search(r'\.([a-z]{2,3})\.(wav|flac)$', path or '', _re.I)
+        return m.group(1).upper()[:3] if m else None
     i = 2
     while i < len(args):
         if args[i] == '--audio': wav_path = args[i + 1]; i += 2
@@ -317,6 +338,10 @@ def main():
         elif args[i] == '--strip-audio': strip = True; i += 1
         elif args[i] == '--normalize': norm = True; i += 1
         elif args[i] == '--subtype': subtype = int(args[i + 1]); i += 2
+        elif args[i] == '--trailer-audio': tr_wav = args[i + 1]; i += 2
+        elif args[i] == '--trailer-srt': tr_srt = args[i + 1]; i += 2
+        elif args[i] == '--lang': lang_main = args[i + 1][:3].upper(); i += 2
+        elif args[i] == '--trailer-lang': lang_alt = args[i + 1][:3].upper(); i += 2
         else: print('unknown arg', args[i]); sys.exit(1)
 
     data = open(src, 'rb').read()
@@ -482,6 +507,28 @@ def main():
             w += nbytes
         print(f'  seek index: {patched}/{cnt} offsets remapped')
 
+    if tr_wav or tr_srt:
+        payload = bytearray()
+        lm = lang_main or infer_lang(wav_path)
+        if lm:
+            payload += struct.pack('<4sI4s', b'LNG0', 4, lm.encode()[:3].ljust(4, b'\0'))
+            print(f'  in-band language tag: {lm}')
+        if tr_srt:
+            srt = open(tr_srt, 'rb').read()
+            payload += struct.pack('<4sI', b'SUB0', len(srt)) + srt
+            print(f'  trailer subs: {len(srt)} B')
+        if tr_wav:
+            pcm, chn, rate = load_wav(tr_wav)
+            total = len(pcm) // chn
+            pad = (-total) % PKT_SAMPLES                 # pad tail with silence to a full packet
+            pcm = pcm + [0] * (pad * chn)
+            apkts = adpcm_packets(pcm, chn, rate)
+            blob = b''.join(pl for _, pl in apkts)
+            la = (lang_alt or infer_lang(tr_wav) or 'ALT').encode()[:3].ljust(4, b'\0')
+            payload += struct.pack('<4sIIHH4s', b'AUD1', 12 + len(blob), rate, chn, PKT_SAMPLES, la) + blob
+            print(f'  trailer audio [{la.rstrip(b"\0").decode()}]: {len(apkts)} packets @{rate}Hz x{chn} ({len(blob)} B)')
+        base = len(out)
+        out += payload + struct.pack('<Q8s', base, b'CSXTRA01')
     open(dst, 'wb').write(out)
     print(f'wrote {dst}: {len(out)} B ({len(out)-len(data):+} B)')
 
