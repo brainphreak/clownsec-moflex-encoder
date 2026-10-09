@@ -31,7 +31,8 @@ Usage:
   --trailer-audio x.wav  second language as a TRAILER after the last block (official player
                          never reads it; ours plays it as Audio Track 2)
   --trailer-srt x.srt    subtitles in the trailer; REPEATABLE for multiple languages
-                         (lang tag from '.eng.srt'-style names; first listed = default)
+                         (lang tag from '.eng.srt'-style names; first listed = default).
+                         An .ass/.ssa goes in as-is: the player tells the formats apart by content.
   --nfo info.txt         library metadata (key=value lines: title, year, desc, genres,
                          category, runtime, date) -> 'NFO0' section; the player imports it
                          so the file needs NO scraping, even offline
@@ -51,6 +52,7 @@ everything extra lives past the final block:
     'LNG0' -> char lang[4]: language of the IN-BAND audio track ("ENG")
   Languages auto-infer from ".xxx.wav" filenames; --lang / --trailer-lang override.
 """
+import array
 import struct
 import sys
 import wave
@@ -139,7 +141,13 @@ class ImaCh:
 
 def ima_nibble(ch, sample):
     step = STEP[ch.step]
-    diff = sample - ch.pred
+    # int(), and not for tidiness: `sample` arrives as a numpy int16 and ch.pred is a Python
+    # int, so under numpy 2's weak-scalar rules the subtraction STAYS int16 and OVERFLOWS
+    # whenever the signal is more than 32767 away from the predictor. The sign flips, the
+    # encoder emits a nibble pointing the wrong way, and the decoder reconstructs a ~40000
+    # jump -- an audible click. Loud transients hit it most, which is why it showed up after
+    # loudness normalisation raised the level. Older numpy promoted to int64 and hid it.
+    diff = int(sample) - int(ch.pred)
     nib = 0
     if diff < 0:
         nib = 8; diff = -diff
@@ -339,7 +347,7 @@ def main():
 
     def infer_lang_ext(path):
         import re as _re
-        m = _re.search(r'\.([a-z]{2,3})\.(srt)$', path or '', _re.I)
+        m = _re.search(r'\.([a-z]{2,3})\.(srt|ass|ssa)$', path or '', _re.I)   # SUB1 holds ASS too
         return m.group(1).upper()[:3] if m else None
     i = 2
     while i < len(args):
@@ -392,14 +400,29 @@ def main():
         w = wave.open(path, 'rb')
         assert w.getsampwidth() == 2, 'need 16-bit PCM'
         chn, rate = w.getnchannels(), w.getframerate()
-        pcm = list(struct.unpack(f'<{w.getnframes() * chn}h', w.readframes(w.getnframes())))
+        # A Python list costs ~8 bytes of pointer plus a distinct int object per sample, and the
+        # struct.unpack tuple doubles that while it is being built. A 134-minute stereo track is
+        # 709M samples, so the pair ran to well over 10 GB and the OOM killer SIGKILLed this
+        # process -- Princess Mononoke and Castle in the Sky died here while shorter films in the
+        # same batch passed. array('h') is 2 bytes a sample and supports everything used below:
+        # len, integer indexing, max/min. Read in chunks so the raw bytes are never all resident.
+        pcm = array.array('h')
+        left = w.getnframes()
+        while left > 0:
+            b = w.readframes(min(1 << 20, left))
+            if not b:
+                break
+            pcm.frombytes(b)
+            left -= len(b) // (2 * chn)
+        if sys.byteorder == 'big':                      # WAV samples are little-endian
+            pcm.byteswap()
         w.close()
         if norm:
             peak = max(1, max(pcm), -min(pcm))
             target = 29204                              # -1.0 dBFS: scale=target/peak, clip-proof
             if peak != target:
                 sc = target / peak
-                pcm = [int(x * sc) for x in pcm]
+                pcm = array.array('h', (int(x * sc) for x in pcm))
                 db = __import__('math').log10(sc) * 20
                 print(f'    normalize {path.split("/")[-1]}: peak {peak} -> {target} ({db:+.1f} dB)')
         return pcm, chn, rate
@@ -550,7 +573,7 @@ def main():
             pcm, chn, rate = load_wav(tr_wav)
             total = len(pcm) // chn
             pad = (-total) % PKT_SAMPLES                 # pad tail with silence to a full packet
-            pcm = pcm + [0] * (pad * chn)
+            pcm.extend(array.array('h', bytes(2 * pad * chn)))   # in place: no second copy
             apkts = adpcm_packets(pcm, chn, rate)
             blob = b''.join(pl for _, pl in apkts)
             la = (lang_alt or infer_lang(tr_wav) or 'ALT').encode()[:3].ljust(4, b'\0')
