@@ -122,6 +122,27 @@ python3 tools/moflex_combine.py combine out.moflex seg1.moflex seg2.moflex [...]
 | Nintendo-encoded source (48 kHz, 2 KB blocks, 12 min) | ✅ audio bit-identical over 744 s |
 | two full-length discs (1.2 GB + 0.8 GB, 2:30:51) in the **official player** | ✅ opens, plays through the seam, full duration shown, seeking intact (2026-07-26) |
 
+## tools/make_super_moflex.py — SUPER MOFLEX
+
+One command from the original MP4/MKV plus its encoded `.moflex` to a **super moflex**: the English
+track normalised and in-band (what Nintendo's player plays), plus a trailer the Clownsec 3DS player
+reads — the original-language audio, every text subtitle track (ASS/SSA kept as styled ASS by
+default, `--flatten-ass` for SRT), library info and a poster.
+
+```
+python3 tools/make_super_moflex.py source.mkv encoded.moflex --format converted --3d
+```
+
+Needs `ffmpeg`/`ffprobe`. Its helpers sit beside it: `moflex_addstreams.py` (writes the file),
+`ass_to_srt.py` (cleans ASS: karaoke layers, drawings and fonts out) and `srt_clean.py`.
+Run it with no arguments for every option.
+
+**TMDB token (optional).** Title, year, genres, synopsis and poster come from TMDB. None ships
+with this repo — use your own "API Read Access Token" from
+<https://www.themoviedb.org/settings/api>, either as `TMDB_TOKEN=...` in the environment or as the
+first line of `~/.config/moflex-encoder/tmdb_token`. Without one it runs as `--no-net` and asks
+for the details instead.
+
 ## Status / roadmap
 
 - [x] Understand the moflex container block format (see `docs/moflex-format.md`)
