@@ -674,6 +674,11 @@ def main():
     if orig_wav:
         cmd += ['--trailer-audio', orig_wav, '--trailer-lang', orig_lang]
     for c, p in srt_files:
+        # the player skips a SUB section over 1 MiB without a word: the track just never shows
+        # in its menu (a raw karaoke ASS hit this at 1.4 MB; cleaned it is ~40 KB)
+        if os.path.getsize(p) + 4 > 1024 * 1024:
+            sys.exit(f'  *** {c} subtitle {os.path.basename(p)} is {os.path.getsize(p):,} B -- '
+                     f'over the 1 MiB the player accepts; it would never appear. Trim or drop it.')
         cmd += ['--trailer-srt', p]
     if info['poster']:
         cmd += ['--art', info['poster']]
