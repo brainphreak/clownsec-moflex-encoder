@@ -34,7 +34,7 @@ Usage:
                      track, which is wrong for a WEB-DL carrying 40 of them (19 of
                      them forced), and for scripts the player has no glyphs for --
                      Chinese renders as holes, since the 16x16 table is JIS kanji.
-    --sub-label N=X,M=Y  set the label (2-3 letters) the player shows for embedded subtitle
+    --sub-label N=X,M=Y  set the label (2-3 characters, starting with a letter: dub, en2) the player shows for embedded subtitle
                      stream N, like the '.xxx.srt' name does for --srt files, e.g.
                      --sub-label 4=dub,5=sgn. For a track the source mistags, or to tell two
                      same-language tracks apart. Works with --subs (it only labels; --subs picks).
@@ -265,10 +265,10 @@ def main():
                 if not pair.strip(): continue
                 n, _, code = pair.partition('=')
                 code = code.strip().lower()
-                # moflex_addstreams reads the tag from '.<lang>.srt' and takes LETTERS only:
-                # anything else would ship as 'SUB'
-                if not n.strip().isdigit() or not re.fullmatch(r'[a-z]{2,3}', code):
-                    print(f'  --sub-label wants STREAM=CODE with a 2-3 letter code, got {pair!r}'); sys.exit(1)
+                # moflex_addstreams reads the tag from '.<lang>.srt': a letter, then letters or
+                # digits ('dub', 'en2'). Anything else would ship as 'SUB'
+                if not n.strip().isdigit() or not re.fullmatch(r'[a-z][a-z0-9]{1,2}', code):
+                    print(f'  --sub-label wants STREAM=CODE with a 2-3 character code starting with a letter, got {pair!r}'); sys.exit(1)
                 sub_labels[int(n)] = code
             i += 2
         elif args[i] == '--audio2-lang': a2_lang = args[i + 1][:3].upper(); i += 2
@@ -505,7 +505,7 @@ def main():
         print(f'  NOTE: {skipped_img} image-based (PGS/VobSub) subtitle tracks skipped '
               f'-- they need OCR to become text. Supply text .srt via --srt to include subs.')
     for p in extra_srts:
-        m = re.search(r'\.([a-z]{2,3})\.(srt|ass|ssa)$', p, re.I)
+        m = re.search(r'\.([a-z][a-z0-9]{1,2})\.(srt|ass|ssa)$', p, re.I)
         c = (m.group(1).lower() if m else 'ext')
         is_ass = bool(re.search(r'\.(ass|ssa)$', p, re.I))
         if c not in seen:

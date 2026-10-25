@@ -347,7 +347,8 @@ def main():
 
     def infer_lang_ext(path):
         import re as _re
-        m = _re.search(r'\.([a-z]{2,3})\.(srt|ass|ssa)$', path or '', _re.I)   # SUB1 holds ASS too
+        m = _re.search(r'\.([a-z][a-z0-9]{1,2})\.(srt|ass|ssa)$', path or '', _re.I)   # SUB1 holds ASS too;
+        # a digit is allowed after the first letter so 'en2' (a second English track) keeps its tag
         return m.group(1).upper()[:3] if m else None
     i = 2
     while i < len(args):
