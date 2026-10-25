@@ -34,6 +34,10 @@ Usage:
                      track, which is wrong for a WEB-DL carrying 40 of them (19 of
                      them forced), and for scripts the player has no glyphs for --
                      Chinese renders as holes, since the 16x16 table is JIS kanji.
+    --sub-label N=X,M=Y  set the label (2-3 letters) the player shows for embedded subtitle
+                     stream N, like the '.xxx.srt' name does for --srt files, e.g.
+                     --sub-label 4=dub,5=sgn. For a track the source mistags, or to tell two
+                     same-language tracks apart. Works with --subs (it only labels; --subs picks).
     --tmdb-se S:E    look the episode up at these TMDB coordinates instead of the ones in the
                      filename. Some shows are numbered continuously there: Re:Zero is one
                      85-episode "season 1", so its S02e01 is TMDB season 1 episode 26.
@@ -232,6 +236,7 @@ def main():
     a_main = a_second = None; o_art = None; a2_lang = None; tmdb_se = None; o_genres = ''
     o_lang = None
     only_subs = None
+    sub_labels = {}                      # --sub-label: stream index -> code shown on the player
     keep_ass = True                      # player 61008.1+ renders ASS/SSA; --flatten-ass opts out
     i = 2
     while i < len(args):
@@ -255,6 +260,17 @@ def main():
         elif args[i] == '--add-genres': o_genres = args[i + 1]; i += 2
         elif args[i] == '--subs':
             only_subs = {int(x) for x in args[i + 1].split(',') if x.strip()}; i += 2
+        elif args[i] == '--sub-label':
+            for pair in args[i + 1].split(','):
+                if not pair.strip(): continue
+                n, _, code = pair.partition('=')
+                code = code.strip().lower()
+                # moflex_addstreams reads the tag from '.<lang>.srt' and takes LETTERS only:
+                # anything else would ship as 'SUB'
+                if not n.strip().isdigit() or not re.fullmatch(r'[a-z]{2,3}', code):
+                    print(f'  --sub-label wants STREAM=CODE with a 2-3 letter code, got {pair!r}'); sys.exit(1)
+                sub_labels[int(n)] = code
+            i += 2
         elif args[i] == '--audio2-lang': a2_lang = args[i + 1][:3].upper(); i += 2
         elif args[i] == '--lang': o_lang = args[i + 1][:3].lower(); i += 2
         elif args[i] == '--tmdb-se':
@@ -405,6 +421,12 @@ def main():
     orig_wav = wav(a_orig, orig_lang.lower()) if a_orig else None
     print(f'  audio: eng ok' + (f', {orig_lang} ok' if orig_wav else ''))
 
+    for n in sorted(sub_labels):
+        st = next((x for x in subs if x['index'] == n), None)
+        if st is None:
+            print(f'  NOTE: --sub-label {n}={sub_labels[n]}: stream {n} is not a subtitle track -- ignored')
+        elif only_subs is not None and n not in only_subs:
+            print(f'  NOTE: --sub-label {n}={sub_labels[n]}: stream {n} is not in --subs -- ignored')
     # ---- extract every subtitle ----
     srt_files = []                       # (code, path) -- eng first later
     seen = set()
@@ -416,7 +438,7 @@ def main():
         if st.get('codec_name') in IMAGE_SUBS:   # PGS/VobSub -> images, need OCR (not text)
             skipped_img += 1; continue
         tags = st.get('tags', {})
-        c = sub_code(tags.get('language', 'und'), tags.get('title'))
+        c = sub_labels.get(st['index']) or sub_code(tags.get('language', 'und'), tags.get('title'))
         if c in seen:
             # Two tracks of the same language and no label to tell them apart. Dropping the
             # second was fine when it was a duplicate, and wrong the moment a release carried
