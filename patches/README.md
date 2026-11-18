@@ -1,44 +1,32 @@
-# Encoder patches
+# The moflex encoder Big Top ships
 
-Source patches that improve the MobiClip encoder's efficiency, on top of the
-mobipeg toolchain (an FFmpeg fork + its x264 fork). Each patch is verified against
-our bit-exact MobiClip decoder — see `../docs/progress.md` for measured results.
+Big Top streams MP4/MKV to an Old 3DS by encoding them to moflex as they play. The encoder is
+**Mobipeg-MOFLEX by Movie Bot** (https://github.com/Oldhimaster1/Mobipeg-MOFLEX), an FFmpeg +
+x264 build with a MobiClip encoder and moflex muxer, (base commit 1ed42b1) with the changes in
+`mobipeg-moflex-clownsec.patch` applied on top. FFmpeg and x264 are GPL; so is this encoder.
 
-## 8×8 luma transform (`*-8x8-luma.patch`)
+## What the patch adds
 
-MobiClip supports an 8×8 luma transform, but mobipeg only ever coded luma as 4×4.
-These patches wire the decoder-exact 8×8 transform (the same `mobi_add8x8_idct8` /
-`mobi_quant_8x8` math mobipeg already uses for chroma) into the inter luma path.
+All of it is behind environment switches; with none set, output is byte-identical to Mobipeg-MOFLEX.
 
-Covers **both** the inter (P-frame) and intra (I-frame) luma paths. They are enabled
-together by design: 8×8 P-frames next to 4×4 I-frames make each keyframe a visible
-grain/noise pulse, so I-frames must use 8×8 too.
+- `MOBI_8X8=1`, `MOBI_8X8_MS=1` — an 8x8 luma transform that matches the decoder exactly, with a per-block
+  8x8 intra direction search
+- `MOBI_CSPLIT=1` — a P-frame chroma 8x8 can be coded as four 4x4 transforms with a coded-quarter mask,
+  chosen per block by distortion + bits (stops colour ringing around sharp edges)
+- `MOBI_CSPLIT_I=1` — the same for intra chroma, with per-quarter decoder-exact prediction (experimental)
+- `MOBI_INTER4_DZ=1` — fix: motion-compensated 4x4 luma blocks were quantized with intra rounding, so the
+  inter deadzone (`MOBI_DZ`) never reached them
+- `MOBI_P_INTRA_BIAS=n` — intra must beat inter by n% in a P frame
+- `MOBI_AQ=1`, `MOBI_AQ_OFFSET`, `MOBI_AQ_DARK`, `MOBI_AQ_DARKQ` — a quantizer per frame from its
+  brightness and detail, fitted to the official encoder's own choices (finest step on dark frames)
+- `MOBI_KEY_DQ=n`, `MOBI_LRD=1`, `MOBI_LAMBDA_FULLQ=1` — experiments (see the notes in the code)
+- the x264 reconstruction dump (`dump-yuv`) writes MobiClip's planar chroma correctly, so encoder output
+  can be checked against a decoder byte for byte
 
-**Result:** round-trips bit-exact through our decoder (no drift, no keyframe pulse).
-On busy 3D nature footage, full 8×8 is **26 % smaller at qyx2 and 36 % at qyx4** than
-the 4×4 baseline; on smoother content the high-quality range (qyx2–3) drops 36–49 %.
-The largest frames (I-frames) shrink 22–33 %.
+Measured against the official encoder (Nintendo's) on dark film and checked on Old 3DS hardware; every
+switch combination Big Top uses reconstructs exactly what the 3DS decoder does.
 
-**Build note:** FFmpeg's `ffmpeg` target does not depend on the external `libx264.a`,
-so after rebuilding x264 you must force a relink or you keep running the old encoder:
-`cd mobipeg_src && rm -f ffmpeg ffmpeg_g && touch libavcodec/libx264.c && make -j ffmpeg`.
+## Building
 
-- `x264-mobiclip-8x8-luma.patch` → apply in the `quatric/x264` tree
-- `mobipeg-mobiclip-8x8-luma.patch` → apply in the `quatric/mobipeg` tree
-
-Gated behind the `MOBI_8X8` environment variable, so a default build reproduces the
-4×4 baseline byte-for-byte (one binary does both — set `MOBI_8X8=1` to encode with 8×8).
-
-### Build & use
-
-Follow the build in `../docs/progress.md` (x264 → mobipeg ffmpeg), applying the patches
-first:
-
-```bash
-cd x264        && git apply /path/to/x264-mobiclip-8x8-luma.patch
-cd mobipeg_src && git apply /path/to/mobipeg-mobiclip-8x8-luma.patch
-# ...configure + make as in progress.md...
-
-# encode with the 8×8 transform enabled:
-MOBI_8X8=1 ffmpeg -i in.mp4 -c:v mobiclip -mobi_qyx 2 ... out.moflex
-```
+`tools/build_encoder_cross.sh <linux-x86_64|windows-x86_64|macos-arm64|macos-x86_64> <source dir>` builds it
+with Zig from one machine: a source tree is Mobipeg-MOFLEX's `native/source` with the patch applied.

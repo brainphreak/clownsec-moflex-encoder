@@ -1,0 +1,941 @@
+diff --git a/native/source/x264/common/common.h b/native/source/x264/common/common.h
+index 199ce51..86f613d 100644
+--- a/native/source/x264/common/common.h
++++ b/native/source/x264/common/common.h
+@@ -546,6 +546,8 @@ struct x264_t
+ 
+         int     i_cbp_luma;
+         int     i_cbp_chroma;
++        int     i_mobi_csplit[2];   /* mobiclip: chroma plane coded as four 4x4 (P only) */
++        int     i_mobi_cmask[2];    /*   which 4x4 quarters carry coefficients */
+ 
+         int     i_intra16x16_pred_mode;
+         int     i_chroma_pred_mode;
+diff --git a/native/source/x264/encoder/analyse.c b/native/source/x264/encoder/analyse.c
+index 5e6cde3..8064943 100644
+--- a/native/source/x264/encoder/analyse.c
++++ b/native/source/x264/encoder/analyse.c
+@@ -660,6 +660,21 @@ static void mb_analyse_init_qp( x264_t *h, x264_mb_analysis_t *a, int qp )
+         i_mobi_lambda_qp = x264_clip3( qp + offset, 0, QP_MAX );
+     }
+ 
++    /* MOBI_LAMBDA_FULLQ: lambda from the step the frame really uses. mobi_q4 IS H.264's 4x4
++     * dequant scale and the decoder shifts it by qy (Q = 6*qy + qx), where H.264 shifts by
++     * QP/6 - 4: MobiClip Q equals H.264 QP Q + 24. x264's qp here is only the 12..17 phase,
++     * so every decision ran at a near-lossless lambda while the frame quantized ~24 QP coarser.
++     * Optional offset: MOBI_LAMBDA_FULLQ=1 -> +0, or any other value v -> v - 1. */
++    if( h->param.i_mobiclip )
++    {
++        static int fq = -9999;
++        if( fq == -9999 ) { const char *e = getenv( "MOBI_LAMBDA_FULLQ" ); fq = e ? atoi( e ) : 0; }
++        if( fq )
++        {
++            int q_emit = (qp % 6) + 12 + 6 * x264_clip3( h->param.i_mobi_qyx, 0, 15 );
++            i_mobi_lambda_qp = x264_clip3( q_emit + 24 + (fq - 1), 0, QP_MAX );
++        }
++    }
+     int effective_chroma_qp = h->chroma_qp_table[SPEC_QP(qp)] + X264_MAX( qp - QP_MAX_SPEC, 0 );
+     a->i_lambda = x264_lambda_tab[i_mobi_lambda_qp];
+     a->i_lambda2 = x264_lambda2_tab[i_mobi_lambda_qp];
+@@ -3755,10 +3770,16 @@ skip_analysis:
+                 MOBI_APROF( 7, intra_rd( h, &analysis, i_satd_inter * 5/4 + 1 ) );
+             }
+ 
+-            /* Mobiclip: only I_4x4 intra is supported (see intra_analysis). */
++            /* Mobiclip: only I_4x4 intra is supported (see intra_analysis).
++             * MOBI_P_INTRA_BIAS (percent, default 100 = unchanged): intra must beat inter by that
++             * factor in a P frame. On grainy film the inter residual is noise, so intra "won" ~5.6x
++             * as often as in the official encoder -- the costliest blocks there are. */
+             if( h->param.i_mobiclip )
+             {
+-                COPY2_IF_LT( i_cost, analysis.i_satd_i4x4, i_type, I_4x4 );
++                static int bias = -1;
++                if( bias < 0 ) { const char *e = getenv( "MOBI_P_INTRA_BIAS" ); bias = e ? atoi( e ) : 100; if( bias < 1 ) bias = 100; }
++                int ic = analysis.i_satd_i4x4 >= COST_MAX / 4 ? COST_MAX : (int)( (int64_t)analysis.i_satd_i4x4 * bias / 100 );
++                if( ic < i_cost ) { i_cost = analysis.i_satd_i4x4; i_type = I_4x4; }
+             }
+             else
+             {
+diff --git a/native/source/x264/encoder/cavlc.c b/native/source/x264/encoder/cavlc.c
+index 2d3cb21..770c281 100644
+--- a/native/source/x264/encoder/cavlc.c
++++ b/native/source/x264/encoder/cavlc.c
+@@ -1201,7 +1201,16 @@ static void encode_i_block(x264_t *h)
+ 	for (int k = 0; k < 2; k++)
+ 	{
+ 		int i = k == 0 ? cf : cs;
+-		if (h->mb.cache.non_zero_count[x264_scan8[16 + i * 16]])
++		if (h->mb.cache.non_zero_count[x264_scan8[16 + i * 16]] && h->mb.i_mobi_csplit[i] == 2)
++		{
++			/* MOBI_CSPLIT_I: four 4x4 predictions, code t <-> mask = block4x4_coefficients_tab[t-1] */
++			static const uint8_t intra_t[16] = { 2, 4, 3, 8, 5, 14, 16, 12, 6, 15, 13, 9, 7, 10, 11, 1 };
++			bs_write_ue(s, intra_t[h->mb.i_mobi_cmask[i]]);
++			for (int q = 0; q < 4; q++)
++				if ((h->mb.i_mobi_cmask[i] >> q) & 1)
++					encode_dct(h, h->dct.luma4x4[16 + 16 * i + q], 16, h->sh.i_type == SLICE_TYPE_I ? 1 : 0);
++		}
++		else if (h->mb.cache.non_zero_count[x264_scan8[16 + i * 16]])
+ 		{
+ 			bs_write1(s, 1);//don't subdivide into 4x4
+ 			h->stat.frame.i_mv_bits++;
+@@ -1842,7 +1851,15 @@ static void encode_p_block(x264_t *h)
+ 		for (int k = 0; k < 2; k++)
+ 		{
+ 			int i = k == 0 ? cf : cs;
+-			if (h->mb.cache.non_zero_count[x264_scan8[16 + i * 16]])
++			if (h->mb.cache.non_zero_count[x264_scan8[16 + i * 16]] && h->mb.i_mobi_csplit[i])
++			{
++				/* MOBI_CSPLIT: four 4x4, a mask of the coded quarters */
++				bs_write_ue(s, REV_byte_1165C4[h->mb.i_mobi_cmask[i]]);
++				for (int q = 0; q < 4; q++)
++					if ((h->mb.i_mobi_cmask[i] >> q) & 1)
++						encode_dct(h, h->dct.luma4x4[16 + 16 * i + q], 16, h->sh.i_type == SLICE_TYPE_I ? 1 : 0);
++			}
++			else if (h->mb.cache.non_zero_count[x264_scan8[16 + i * 16]])
+ 			{
+ 				bs_write1(s, 1);//don't subdivide into 4x4
+ 				h->stat.frame.i_mv_bits++;
+@@ -3735,7 +3752,15 @@ static int chroma_size_cavlc( x264_t *h )
+ 	for (int i = 0; i < 2; i++)
+ 	{
+ 		int p = planes[i];
+-		if (h->mb.cache.non_zero_count[x264_scan8[16 + p * 16]])
++		if (h->mb.cache.non_zero_count[x264_scan8[16 + p * 16]] && h->mb.i_mobi_csplit[p])
++		{
++			static const uint8_t intra_t[16] = { 2, 4, 3, 8, 5, 14, 16, 12, 6, 15, 13, 9, 7, 10, 11, 1 };
++			bs_write_ue(&h->out.bs, h->mb.i_mobi_csplit[p] == 2 ? intra_t[h->mb.i_mobi_cmask[p]] : REV_byte_1165C4[h->mb.i_mobi_cmask[p]]);
++			for (int q = 0; q < 4; q++)
++				if ((h->mb.i_mobi_cmask[p] >> q) & 1)
++					encode_dct(h, h->dct.luma4x4[16 + 16 * p + q], 16, h->sh.i_type == SLICE_TYPE_I ? 1 : 0);
++		}
++		else if (h->mb.cache.non_zero_count[x264_scan8[16 + p * 16]])
+ 		{
+ 			bs_write1(&h->out.bs, 1);//don't subdivide into 4x4
+ 			h->mb.cache.non_zero_count[x264_scan8[16 + p * 16]] = encode_dct(h, h->dct.luma8x8[4 + 4 * p], 64, h->sh.i_type == SLICE_TYPE_I ? 1 : 0);
+diff --git a/native/source/x264/encoder/encoder.c b/native/source/x264/encoder/encoder.c
+index db72159..4946ac1 100644
+--- a/native/source/x264/encoder/encoder.c
++++ b/native/source/x264/encoder/encoder.c
+@@ -182,7 +182,16 @@ static void frame_dump( x264_t *h )
+         for( int p = 0; p < (CHROMA444 ? 3 : 1); p++ )
+             for( int y = 0; y < h->param.i_height; y++ )
+                 fwrite( &h->fdec->plane[p][y*h->fdec->i_stride[p]], SIZEOF_PIXEL, h->param.i_width, f );
+-        if( CHROMA_FORMAT == CHROMA_420 || CHROMA_FORMAT == CHROMA_422 )
++        if( h->param.i_mobiclip && CHROMA_FORMAT == CHROMA_420 )
++        {
++            /* MobiClip keeps U and V as separate planes (macroblock_store_pic), not NV12:
++             * deinterleaving them scrambled every non-grey colour in the dump */
++            int cw = h->param.i_width>>1, ch = h->param.i_height>>1;
++            for( int p = 1; p <= 2; p++ )
++                for( int y = 0; y < ch; y++ )
++                    fwrite( &h->fdec->plane[p][y*h->fdec->i_stride[1]], SIZEOF_PIXEL, cw, f );
++        }
++        else if( CHROMA_FORMAT == CHROMA_420 || CHROMA_FORMAT == CHROMA_422 )
+         {
+             int cw = h->param.i_width>>1;
+             int ch = h->param.i_height>>CHROMA_V_SHIFT;
+@@ -1310,7 +1319,7 @@ static int validate_parameters( x264_t *h, int b_open )
+         /* Q8-ACT4: default-off, residual-only luma 8x8 experiment. */
+         {
+             const char *e = getenv("MOBI_LUMA8X8_EXPERIMENTAL");
+-            h->param.analyse.b_transform_8x8 = e && atoi(e) ? 1 : 0;
++            h->param.analyse.b_transform_8x8 = (e && atoi(e)) || getenv("MOBI_8X8") ? 1 : 0;   /* MOBI_8X8: decoder-exact 8x8 luma */
+             /* Retain MobiClip per-4x4 intra-prediction syntax. */
+             h->param.analyse.intra &= ~X264_ANALYSE_I8x8;
+             h->param.analyse.inter &= ~X264_ANALYSE_I8x8;
+@@ -3111,7 +3120,25 @@ static intptr_t slice_write( x264_t *h )
+             mobi_t0 = mobi_t1;
+         }
+ 
++        /* MOBI_ROWCHK (debug): snapshot this MB's chroma row just above, in the frame, to catch
++         * anything writing outside the MB (an encoder/decoder chroma mismatch starts there) */
++        static int rowchk = -1; if( rowchk < 0 ) rowchk = getenv( "MOBI_ROWCHK" ) ? 1 : 0;
++        pixel rc_save[2][3][8]; int rc_on = 0;
++        if( rowchk && h->param.i_mobiclip && i_mb_y > 0 )
++        {
++            rc_on = 1;
++            for( int c = 0; c < 2; c++ )
++                for( int r = 0; r < 3; r++ )   /* rows: above (-1), first own row (0), left column top */
++                    for( int x = 0; x < 8; x++ )
++                        rc_save[c][r][x] = h->fdec->plane[1+c][(i_mb_y*8 - 1 + (r==1)) * h->fdec->i_stride[1] + i_mb_x*8 + x];
++        }
+         x264_macroblock_analyse( h );
++        if( rc_on )
++            for( int c = 0; c < 2; c++ )
++                for( int x = 0; x < 8; x++ )
++                    if( rc_save[c][0][x] != h->fdec->plane[1+c][(i_mb_y*8 - 1) * h->fdec->i_stride[1] + i_mb_x*8 + x] )
++                    { fprintf( stderr, "[ROWCHK] frame %d MB(%d,%d) type %d: ANALYSE changed the row above (plane %d x %d)\n",
++                               h->fenc->i_frame, i_mb_x, i_mb_y, h->mb.i_type, c, x ); rc_on = 2; break; }
+ 
+         if( mobi_profile )
+         {
+@@ -3232,6 +3259,25 @@ cont:
+ 
+         /* save cache */
+         x264_macroblock_cache_save( h );
++        static const char *pw_env = (const char *)-1; if( pw_env == (const char *)-1 ) pw_env = getenv( "MOBI_PIXWATCH" );
++        if( pw_env )   /* debug: plane,x,y,frame -- report each change of that pixel */
++        {
++            static int last = -1;
++            int wp, wx, wy, wf; sscanf( pw_env, "%d,%d,%d,%d", &wp, &wx, &wy, &wf );
++            if( h->fenc->i_frame == wf )
++            {
++                int v = h->fdec->plane[wp][wy * h->fdec->i_stride[wp] + wx];
++                if( v != last ) fprintf( stderr, "[PIX] frame %d after MB(%d,%d) type %d: %d -> %d\n", wf, i_mb_x, i_mb_y, h->mb.i_type, last, v );
++                last = v;
++            }
++        }
++        if( rc_on == 1 )
++            for( int c = 0; c < 2; c++ )
++                for( int x = 0; x < 8; x++ )
++                    if( rc_save[c][0][x] != h->fdec->plane[1+c][(i_mb_y*8 - 1) * h->fdec->i_stride[1] + i_mb_x*8 + x] )
++                    { fprintf( stderr, "[ROWCHK] frame %d MB(%d,%d) type %d: ENCODE/STORE changed the row above (plane %d x %d: %d -> %d)\n",
++                               h->fenc->i_frame, i_mb_x, i_mb_y, h->mb.i_type, c, x, rc_save[c][0][x],
++                               h->fdec->plane[1+c][(i_mb_y*8 - 1) * h->fdec->i_stride[1] + i_mb_x*8 + x] ); break; }
+ 
+         if( x264_ratecontrol_mb( h, mb_size ) < 0 )
+         {
+@@ -4145,6 +4191,56 @@ int     x264_encoder_encode( x264_t *h,
+                      h->fenc->i_frame, q, h->param.i_mobi_qyx,
+                      h->fenc->i_qpplus1 - 1 );
+     }
++    else if( h->param.i_mobiclip && getenv( "MOBI_AQ" ) && atoi( getenv( "MOBI_AQ" ) ) && h->param.rc.i_rc_method == X264_RC_CQP )
++    {
++        /* MOBI_AQ: a quantizer per frame from the frame's brightness and detail, fitted to the
++         * official encoder's own choices (decoded from its files): Q 12 on dark frames -- smooth
++         * dark gradients need the fine step and cost little -- up to ~21 on bright busy ones,
++         * where coarseness hides and the bits are. A fixed Q spent most where it was needed least.
++         *   Q = 7.97 + 1.20*log2(mean+1) + 1.94*log2(detail+0.25) + MOBI_AQ_OFFSET
++         * (detail = mean |horizontal luma difference|; fit corr 0.68, mean error 2 steps). */
++        static double off = -1e9;
++        if( off < -1e8 ) { const char *e = getenv( "MOBI_AQ_OFFSET" ); off = e ? atof( e ) : 0; }
++        pixel *pl = h->fenc->plane[0]; int st = h->fenc->i_stride[0];
++        int w = h->param.i_width, ht = h->param.i_height;
++        int64_t sum = 0, dsum = 0;
++        for( int y = 0; y < ht; y++ )
++        {
++            pixel *r = pl + y * st;
++            for( int x = 0; x < w; x++ ) sum += r[x];
++            for( int x = 1; x < w; x++ ) dsum += abs( r[x] - r[x-1] );
++        }
++        double mean = (double)sum / (w * ht), det = (double)dsum / ((w - 1) * ht);
++        int q = (int)floor( 7.97 + 1.20 * log2( mean + 1 ) + 1.94 * log2( det + 0.25 ) + off + 0.5 );
++        /* MOBI_AQ_DARK: near-black frames (mean luma below it, default 25) get at most Q 12 + MOBI_AQ_DARKQ
++         * (default 0) -- the official encoder used the finest step on every dark frame, sharp text or
++         * not (a title in red on black); they are cheap, and a coarse step there rings and blocks */
++        {
++            static double dth = -1; static int dq = -1;
++            if( dth < 0 ) { const char *e = getenv( "MOBI_AQ_DARK" ); dth = e ? atof( e ) : 25;
++                            e = getenv( "MOBI_AQ_DARKQ" ); dq = e ? atoi( e ) : 0; }
++            if( mean < dth && q > 12 + dq ) q = 12 + dq;
++        }
++        if( IS_X264_TYPE_I( h->fenc->i_type ) && getenv( "MOBI_KEY_DQ" ) ) q -= atoi( getenv( "MOBI_KEY_DQ" ) );
++        if( q < 12 ) q = 12; if( q > 59 ) q = 59;
++        h->param.i_mobi_qyx = (q - 12) / 6;
++        h->fenc->i_qpplus1 = 13 + (q - 12) % 6;
++    }
++    else if( h->param.i_mobiclip && getenv( "MOBI_KEY_DQ" ) && h->param.rc.i_rc_method == X264_RC_CQP )
++    {
++        /* Keyframes n quantizer steps finer than the rest: every following frame predicts from them,
++         * so their quality carries through the whole scene (the official encoder's keyframes run
++         * ~3.6x a P frame; ours ~2x at one fixed Q). Same per-frame mechanism as the Q plan above. */
++        static int base_q = -1;
++        if( base_q < 0 )
++            base_q = 12 + h->param.rc.i_qp_constant % 6 + 6 * (h->param.i_mobi_qyx < 0 ? 2 : h->param.i_mobi_qyx);
++        int q = base_q;
++        if( IS_X264_TYPE_I( h->fenc->i_type ) )
++            q -= atoi( getenv( "MOBI_KEY_DQ" ) );
++        if( q < 12 ) q = 12;
++        h->param.i_mobi_qyx = (q - 12) / 6;
++        h->fenc->i_qpplus1 = 13 + (q - 12) % 6;
++    }
+     x264_ratecontrol_start( h, h->fenc->i_qpplus1, overhead*8 );
+     i_global_qp = x264_ratecontrol_qp( h );
+ 
+diff --git a/native/source/x264/encoder/macroblock.c b/native/source/x264/encoder/macroblock.c
+index 999d336..fae02d9 100644
+--- a/native/source/x264/encoder/macroblock.c
++++ b/native/source/x264/encoder/macroblock.c
+@@ -475,6 +475,19 @@ static void mobi_motion_compensate( x264_t *h )
+ {
+     int sy = h->mb.pic.i_stride[0];
+     int sc = h->mb.pic.i_stride[1];
++    static int mvchk = -1; if( mvchk < 0 ) mvchk = getenv( "MOBI_MVCHK" ) ? 1 : 0;
++    if( mvchk && h->mb.i_partition == D_16x16 )
++    {
++        int s0 = x264_scan8[0];
++        for( int k = 0; k < 16; k++ )
++        {
++            int i8 = x264_scan8[0] + (k & 3) + (k >> 2) * 8;
++            if( h->mb.cache.mv[0][i8][0] != h->mb.cache.mv[0][s0][0] || h->mb.cache.mv[0][i8][1] != h->mb.cache.mv[0][s0][1] )
++            { fprintf( stderr, "[MVCHK] frame %d MB(%d,%d) type %d 16x16 but 4x4 #%d mv (%d,%d) != (%d,%d)\n",
++                       h->fenc->i_frame, h->mb.i_mb_x, h->mb.i_mb_y, h->mb.i_type, k,
++                       h->mb.cache.mv[0][i8][0], h->mb.cache.mv[0][i8][1], h->mb.cache.mv[0][s0][0], h->mb.cache.mv[0][s0][1] ); break; }
++        }
++    }
+ 
+     /* Clamp the MV so the motion-compensated 16x16 block stays fully inside the
+      * reference frame.  The Mobiclip decoder reads raw reference data with no
+@@ -636,6 +649,238 @@ static void mobi_motion_compensate( x264_t *h )
+ }
+ #endif
+ 
++/* ---- MOBI_CSPLIT: a P-frame chroma 8x8 may instead be coded as four 4x4 transforms with a mask
++ * of the quarters that carry coefficients (the decoder's add_pframe_coefficients idx > 0; the
++ * prediction is the same motion compensation either way). An edge -- a coloured title on black, a
++ * letterbox line -- then rings only inside its own quarter instead of the whole 8x8 (16x16 pixels),
++ * and an all-black quarter is sent as nothing. The official encoder splits ~40% of P chroma blocks;
++ * this one never did. Chosen per block by SSD + lambda * estimated bits. */
++static int mobi_csplit_on( void )
++{
++    static int v = -1;
++    if( v < 0 ) { const char *e = getenv( "MOBI_CSPLIT" ); v = e && atoi( e ) ? 1 : 0; }
++    return v;
++}
++static int mobi_ue_len( unsigned v ) { int n = 0; v++; while( v >> n ) n++; return 2 * n - 1; }
++static int mobi_level_bits( const dctcoef *zz, int n )   /* a rough CAVLC-like cost */
++{
++    int bits = 0, last = -1;
++    for( int i = 0; i < n; i++ )
++        if( zz[i] ) { int a = abs( zz[i] ), l = 0; while( a >> (l + 1) ) l++; bits += 4 + 2 * l; last = i; }
++    return bits + (last + 1) / 2;
++}
++/* one decoder-exact 4x4 chroma block: quantize (src - dst prediction), store zigzag levels in zz,
++ * reconstruct into dst. Returns non-zero when any level is coded. */
++static int mobi_chroma4x4( x264_t *h, pixel *src, pixel *dst, int i_qp, int b_intra, dctcoef zz[16] )
++{
++    ALIGNED_ARRAY_64( dctcoef, dct4x4, [16] );
++    h->dctf.sub4x4_dct( dct4x4, src, dst );
++    int qx = i_qp % 6, shift = mobi_qyx( h ), nz = 0;
++    for( int z = 0; z < 16; z++ )
++    {
++        int raster = mobi_zigzag4x4[z];
++        int step = (int)mobi_q4[qx][z] << shift;
++        if( mobi_act36_chroma_on() )   /* the 4x4 pair's per-frequency gain, as for luma 4x4 */
++            step = ( step * (int)mobi_act36_norm4[raster] + 512 ) >> 10;
++        int off = mobi_round_off_chroma( h, step, b_intra );
++        int c = dct4x4[raster];
++        int l = c >= 0 ? (c + off) / step : -((-c + off) / step);
++        dct4x4[raster] = l; nz |= l;
++    }
++    if( nz )
++    {
++        int qtab64[16], mat[16];
++        for( int z = 0; z < 16; z++ ) qtab64[mobi_zigzag4x4[z]] = mobi_q4[qx][z] << (2 + shift);
++        for( int pass = 0; ; pass++ )   /* the decoder's MinMaxTable guard, as in the luma 4x4 path */
++        {
++            for( int i = 0; i < 16; i++ ) mat[i] = (int)dct4x4[i] * qtab64[i];
++            mat[0] += 32;
++            for( int i = 0; i < 4; i++ ) mobi_inverse4( &mat[i*4] );
++            for( int y = 0; y < 4; y++ )
++                for( int x = y + 1; x < 4; x++ ) { int t = mat[y*4+x]; mat[y*4+x] = mat[x*4+y]; mat[x*4+y] = t; }
++            for( int y = 0; y < 4; y++ ) { mobi_inverse4( &mat[y*4] ); for( int x = 0; x < 4; x++ ) mat[y*4+x] >>= 6; }
++            int oob = 0;
++            for( int y = 0; y < 4 && !oob; y++ )
++                for( int x = 0; x < 4; x++ ) { int v = dst[y*FDEC_STRIDE+x] + mat[y*4+x]; if( v < -64 || v > 319 ) { oob = 1; break; } }
++            if( !oob || pass >= 16 ) break;
++            int has_ac = 0;
++            for( int i = 1; i < 16; i++ ) if( dct4x4[i] ) { has_ac = 1; break; }
++            if( has_ac ) for( int i = 1; i < 16; i++ ) dct4x4[i] /= 2; else dct4x4[0] /= 2;
++        }
++        nz = 0;
++        for( int i = 0; i < 16; i++ ) nz |= dct4x4[i];
++        if( nz )
++            for( int y = 0; y < 4; y++ )
++                for( int x = 0; x < 4; x++ )
++                    dst[y*FDEC_STRIDE+x] = x264_clip_pixel( dst[y*FDEC_STRIDE+x] + mat[y*4+x] );
++    }
++    for( int z = 0; z < 16; z++ ) zz[z] = dct4x4[mobi_zigzag4x4[z]];
++    return !!nz;
++}
++static void mobi_chroma_try_split( x264_t *h, int ch, pixel *src, pixel *dst, const pixel *pred, int i_qp )
++{
++    int nz8 = h->mb.cache.non_zero_count[x264_scan8[16 + ch * 16]];
++    /* the 8x8 result now in dst: its distortion and cost */
++    pixel rec8[64]; int ssd8 = 0;
++    for( int y = 0; y < 8; y++ )
++        for( int x = 0; x < 8; x++ )
++        {
++            rec8[y*8+x] = dst[y*FDEC_STRIDE+x];
++            int d = src[y*FENC_STRIDE+x] - rec8[y*8+x]; ssd8 += d * d;
++        }
++    int bits8 = nz8 ? 1 + mobi_level_bits( h->dct.luma8x8[4 + 4 * ch], 64 ) : 0;
++    /* four 4x4 from the same prediction */
++    for( int y = 0; y < 8; y++ ) memcpy( &dst[y*FDEC_STRIDE], &pred[y*8], 8*sizeof(pixel) );
++    int mask = 0, bits4 = 0;
++    for( int q = 0; q < 4; q++ )
++    {
++        int ox = (q & 1) * 4, oy = (q >> 1) * 4;
++        dctcoef *zz = h->dct.luma4x4[16 + 16 * ch + q];
++        if( mobi_chroma4x4( h, &src[oy*FENC_STRIDE+ox], &dst[oy*FDEC_STRIDE+ox], i_qp, 0, zz ) )
++        { mask |= 1 << q; bits4 += mobi_level_bits( zz, 16 ); }
++    }
++    static const uint8_t rev[16] = { 0, 2, 4, 6, 1, 7, 15, 10, 3, 14, 8, 13, 5, 11, 12, 9 };   /* = cavlc's REV_byte_1165C4 */
++    if( mask ) bits4 += mobi_ue_len( rev[mask] );
++    int ssd4 = 0;
++    for( int y = 0; y < 8; y++ )
++        for( int x = 0; x < 8; x++ ) { int d = src[y*FENC_STRIDE+x] - dst[y*FDEC_STRIDE+x]; ssd4 += d * d; }
++    /* lambda from the quantizer's pixel step (a DC level is worth step/16 pixels) */
++    static double k = -1;
++    if( k < 0 ) { const char *e = getenv( "MOBI_CSPLIT_K" ); k = e ? atof( e ) : 0.6; }
++    double step = (double)( mobi_q4[i_qp % 6][0] << mobi_qyx( h ) ) / 16.0;
++    double lam = k * step * step;
++    int use4 = mask ? ( ssd4 + lam * bits4 < ssd8 + lam * bits8 ) : ( !nz8 ? 0 : ssd4 + 0.0 < ssd8 + lam * bits8 );
++    if( use4 && mask )
++    {
++        h->mb.i_mobi_csplit[ch] = 1; h->mb.i_mobi_cmask[ch] = mask;
++        h->mb.cache.non_zero_count[x264_scan8[16 + ch * 16]] = 1;
++        h->mb.i_cbp_chroma |= 1 << ch;
++    }
++    else if( use4 )                      /* nothing worth coding: the prediction alone */
++    {
++        h->mb.cache.non_zero_count[x264_scan8[16 + ch * 16]] = 0;
++        h->mb.i_cbp_chroma &= ~(1 << ch);
++    }
++    else                                 /* 8x8 stays: put its reconstruction back */
++        for( int y = 0; y < 8; y++ ) memcpy( &dst[y*FDEC_STRIDE], &rec8[y*8], 8*sizeof(pixel) );
++}
++
++/* ---- MOBI_LRD: rate-distortion check per inter luma 8x8 -- send the residual only when it is
++ * worth its bits, else keep the motion-compensated prediction alone. The official encoder leaves
++ * ~78% of P-frame luma 8x8s uncoded; this one coded ~50% whenever any coefficient survived. */
++static int mobi_lrd_on( void )
++{
++    static int v = -1;
++    if( v < 0 ) { const char *e = getenv( "MOBI_LRD" ); v = e && atoi( e ) ? 1 : 0; }
++    return v;
++}
++static double mobi_lrd_lambda( x264_t *h, int i_qp )
++{
++    static double k = -1;
++    if( k < 0 ) { const char *e = getenv( "MOBI_LRD_K" ); k = e ? atof( e ) : 0.6; }
++    double step = (double)( mobi_q4[i_qp % 6][0] << mobi_qyx( h ) ) / 16.0;
++    return k * step * step;
++}
++static int mobi_ssd8( const pixel *src, const pixel *rec, int rstride )
++{
++    int ssd = 0;
++    for( int y = 0; y < 8; y++ )
++        for( int x = 0; x < 8; x++ ) { int d = src[y*FENC_STRIDE+x] - rec[y*rstride+x]; ssd += d * d; }
++    return ssd;
++}
++
++static ALWAYS_INLINE int mobi_cget( pixel *fp, int fs, pixel *tile, int mx0, int my0, int cw, int chh, int X, int Y )
++{
++    if( X < 0 ) X = 0; else if( X > cw - 1 ) X = cw - 1;
++    if( Y < 0 ) Y = 0; else if( Y > chh - 1 ) Y = chh - 1;
++    if( X >= mx0 && Y >= my0 && X < mx0 + 8 && Y < my0 + 8 )   /* this MB: the tile being reconstructed */
++        return tile[(Y - my0) * FDEC_STRIDE + (X - mx0)];
++    return fp[Y * fs + X];
++}
++/* ---- MOBI_CSPLIT_I: the same choice for INTRA chroma. A split intra block is also PREDICTED per
++ * 4x4 quarter (decoder process_block: predict_intra(size 4) per quarter, in raster order, each
++ * from the reconstructed quarters before it), so the 4x4 path re-predicts. A coloured title on a
++ * keyframe ("ORIGINAL" in red on black) otherwise rings across whole 8x8 chroma blocks. */
++static int mobi_csplit_i_on( void )
++{
++    static int v = -1;
++    if( v < 0 ) { const char *e = getenv( "MOBI_CSPLIT_I" ); v = e && atoi( e ) ? 1 : 0; }
++    return v;
++}
++/* decoder-exact 4x4 chroma prediction (modes 0 V, 1 H, 3 DC: all the chroma mode table emits).
++ * Neighbours inside this MB's chroma block come from the tile being built (tile), others from the
++ * frame (fp); coordinates are clamped like the decoder's pget. */
++static void mobi_predict_chroma_4x4( x264_t *h, int ch, int ox, int oy, int mode, pixel *tile )
++{
++    int mx0 = h->mb.i_mb_x * 8, my0 = h->mb.i_mb_y * 8;
++    int cw = h->param.i_width / 2, chh = h->param.i_height / 2;
++    pixel *fp = h->fdec->plane[1+ch]; int fs = h->fdec->i_stride[1];
++    int ax = mx0 + ox, ay = my0 + oy;
++    #define CG(X, Y) mobi_cget( fp, fs, tile, mx0, my0, cw, chh, (X), (Y) )
++    pixel *d = tile + oy * FDEC_STRIDE + ox;
++    if( mode == 0 )
++    {
++        for( int x = 0; x < 4; x++ ) { int v = CG( ax + x, ay - 1 ); for( int y = 0; y < 4; y++ ) d[y*FDEC_STRIDE+x] = v; }
++    }
++    else if( mode == 1 )
++    {
++        for( int y = 0; y < 4; y++ ) { int v = CG( ax - 1, ay + y ); for( int x = 0; x < 4; x++ ) d[y*FDEC_STRIDE+x] = v; }
++    }
++    else
++    {
++        int fill;
++        if( ax == 0 && ay == 0 ) fill = 0x80;
++        else if( ax >= 1 && ay >= 1 )
++        {
++            int l = 0, t = 0;
++            for( int i = 0; i < 4; i++ ) { l += CG( ax - 1, ay + i ); t += CG( ax + i, ay - 1 ); }
++            fill = ((((l + t) * 2) >> 3) + 1) >> 1;
++        }
++        else if( ax >= 1 ) { int l = 0; for( int i = 0; i < 4; i++ ) l += CG( ax - 1, ay + i ); fill = (((l * 2) >> 2) + 1) >> 1; }
++        else               { int t = 0; for( int i = 0; i < 4; i++ ) t += CG( ax + i, ay - 1 ); fill = (((t * 2) >> 2) + 1) >> 1; }
++        for( int y = 0; y < 4; y++ ) for( int x = 0; x < 4; x++ ) d[y*FDEC_STRIDE+x] = fill;
++    }
++    #undef CG
++}
++static void mobi_chroma_try_split_intra( x264_t *h, int ch, pixel *src, pixel *dst, int i_qp )
++{
++    static const uint8_t fix[7] = { 0, 1, 3, 3, 3, 3, 3 };   /* = mobi_chroma_pred_mode_fix */
++    int mode = fix[h->mb.i_chroma_pred_mode];
++    if( (mode == 0 && h->mb.i_mb_y == 0) || (mode == 1 && h->mb.i_mb_x == 0) ) return;   /* edge reads unseen pixels */
++    int nz8 = h->mb.cache.non_zero_count[x264_scan8[16 + ch * 16]];
++    pixel rec8[64]; int ssd8 = 0;
++    for( int y = 0; y < 8; y++ )
++        for( int x = 0; x < 8; x++ ) { rec8[y*8+x] = dst[y*FDEC_STRIDE+x]; int d = src[y*FENC_STRIDE+x] - rec8[y*8+x]; ssd8 += d * d; }
++    int bits8 = nz8 ? 1 + mobi_level_bits( h->dct.luma8x8[4 + 4 * ch], 64 ) : 0;
++    int mask = 0, bits4 = 0;
++    for( int q = 0; q < 4; q++ )   /* decoder order: (0,0) (4,0) (0,4) (4,4) */
++    {
++        int ox = (q & 1) * 4, oy = (q >> 1) * 4;
++        mobi_predict_chroma_4x4( h, ch, ox, oy, mode, dst );
++        dctcoef *zz = h->dct.luma4x4[16 + 16 * ch + q];
++        if( mobi_chroma4x4( h, &src[oy*FENC_STRIDE+ox], &dst[oy*FDEC_STRIDE+ox], i_qp, 1, zz ) )
++        { mask |= 1 << q; bits4 += mobi_level_bits( zz, 16 ); }
++    }
++    /* code t <-> mask = block4x4_coefficients_tab[t-1] (mask 0 = 4x4 prediction, no residual) */
++    static const uint8_t intra_t[16] = { 2, 4, 3, 8, 5, 14, 16, 12, 6, 15, 13, 9, 7, 10, 11, 1 };
++    bits4 += mobi_ue_len( intra_t[mask] ) + (nz8 ? 0 : 1);   /* + the chroma cbp it then needs */
++    int ssd4 = 0;
++    for( int y = 0; y < 8; y++ )
++        for( int x = 0; x < 8; x++ ) { int d = src[y*FENC_STRIDE+x] - dst[y*FDEC_STRIDE+x]; ssd4 += d * d; }
++    static double k = -1;
++    if( k < 0 ) { const char *e = getenv( "MOBI_CSPLIT_K" ); k = e ? atof( e ) : 0.6; }
++    double step = (double)( mobi_q4[i_qp % 6][0] << mobi_qyx( h ) ) / 16.0;
++    double lam = k * step * step;
++    if( ssd4 + lam * bits4 < ssd8 + lam * bits8 )
++    {
++        h->mb.i_mobi_csplit[ch] = 2; h->mb.i_mobi_cmask[ch] = mask;
++        h->mb.cache.non_zero_count[x264_scan8[16 + ch * 16]] = 1;   /* the split code is read under the cbp bit */
++        h->mb.i_cbp_chroma |= 1 << ch;
++    }
++    else
++        for( int y = 0; y < 8; y++ ) memcpy( &dst[y*FDEC_STRIDE], &rec8[y*8], 8*sizeof(pixel) );
++}
++
+ static ALWAYS_INLINE void mb_encode_chroma_internal( x264_t *h, int b_inter, int i_qp, int chroma422 )
+ {
+     int nz, nz_dc;
+@@ -663,6 +908,10 @@ static ALWAYS_INLINE void mb_encode_chroma_internal( x264_t *h, int b_inter, int
+         {
+             pixel *p_src = h->mb.pic.p_fenc[1+ch];
+             pixel *p_dst = h->mb.pic.p_fdec[1+ch];
++            h->mb.i_mobi_csplit[ch] = 0; h->mb.i_mobi_cmask[ch] = 0;
++            pixel cs_pred[64];   /* the prediction, for the 4x4 alternative below */
++            for( int yy = 0; yy < 8; yy++ )
++                memcpy( &cs_pred[yy*8], &p_dst[yy*FDEC_STRIDE], 8*sizeof(pixel) );
+ 
+             ALIGNED_ARRAY_64(dctcoef, dct8x8, [64]);
+ 
+@@ -725,6 +974,10 @@ static ALWAYS_INLINE void mb_encode_chroma_internal( x264_t *h, int b_inter, int
+             }
+             else
+                 h->mb.cache.non_zero_count[x264_scan8[16 + ch * 16]] = 0;
++            if( b_inter && mobi_csplit_on() )
++                mobi_chroma_try_split( h, ch, p_src, p_dst, cs_pred, i_qp );
++            else if( !b_inter && mobi_csplit_i_on() )
++                mobi_chroma_try_split_intra( h, ch, p_src, p_dst, i_qp );
+             /* (The reconstructed chroma is committed to the frame buffer by
+              * macroblock_store_pic / cache_save, which now stores planar
+              * chroma correctly — no manual write-back needed here.) */
+@@ -1222,6 +1475,101 @@ static ALWAYS_INLINE void macroblock_encode_internal( x264_t *h, int plane_count
+             if( h->mb.i_skip_intra == 2 )
+                 h->mc.memcpy_aligned( h->dct.luma4x4, h->mb.pic.i4x4_dct_buf, sizeof(h->mb.pic.i4x4_dct_buf) );
+         }
++#if !HIGH_BIT_DEPTH
++        if( h->param.i_mobiclip && getenv("MOBI_8X8") && !getenv("MOBI_8X8_NOINTRA") )   /* NOINTRA: keyframes stay 4x4 */
++        {
++            /* Mobiclip 8x8 INTRA luma.  Enabled together with the inter 8x8 path
++             * (same MOBI_8X8 flag) — they MUST go together: 8x8 P-frames beside
++             * 4x4 I-frames make each keyframe a visible grain/noise pulse, since
++             * the I-frame keeps high-frequency detail the smoother 8x8 P-frames
++             * dropped.  Coding I-frames 8x8 too removes the pulse AND shrinks the
++             * (largest) I-frames 22-33%.
++             * Each 8x8 block is predicted
++             * with mobi_predict_8x8 using the top-left 4x4's analysed mode —
++             * exactly the mode cavlc's I_8x8 branch writes — then coded with the
++             * mobi 8x8 transform (decoder-exact).  Edge blocks (ax==0||ay==0) are
++             * forced to DC in intra4x4_pred_mode itself, so the mode we predict
++             * with and the mode cavlc writes stay identical (directional modes at
++             * the frame edge read clamped, not-yet-reconstructed samples and
++             * desync — same constraint as the 4x4 path above).  Setting
++             * i_type=I_8x8 + b_transform_8x8 makes cavlc emit the 8x8 mask+syntax. */
++            static const uint8_t i2h[13] = { 2,0,1,2,2,8,6,5,4,3,2,2,2 };
++            for( int i8 = 0; i8 < 4; i8++ )
++            {
++                int ax = h->mb.i_mb_x*16 + (i8&1)*8;
++                int ay = h->mb.i_mb_y*16 + (i8>>1)*8;
++                if( ax == 0 || ay == 0 )
++                    h->mb.cache.intra4x4_pred_mode[x264_scan8[i8*4]] = I_PRED_4x4_DC;
++            }
++            for( int p = 0; p < plane_count; p++, i_qp = h->mb.i_qp )
++            {
++                int qx = i_qp % 6;
++                int qtab[64];
++                for( int zz = 0; zz < 64; zz++ )
++                    qtab[mobi_zigzag8x8[zz]] = (int)mobi_q8[qx][zz] << mobi_qyx( h );
++                CLEAR_16x16_NNZ( p );
++                for( int i8 = 0; i8 < 4; i8++ )
++                {
++                    int ox = (i8&1)*8, oy = (i8>>1)*8;
++                    int ax = h->mb.i_mb_x*16 + ox, ay = h->mb.i_mb_y*16 + oy;
++                    pixel *p_src = &h->mb.pic.p_fenc[p][ox + oy*FENC_STRIDE];
++                    pixel *p_dst = &h->mb.pic.p_fdec[p][ox + oy*FDEC_STRIDE];
++                    int i_mode = h->mb.cache.intra4x4_pred_mode[x264_scan8[i8*4]];
++                    int i_h264 = i2h[(unsigned)i_mode+1 < 13 ? i_mode+1 : 0];
++                    int mobi_mode = mobi_h264_to_mobiclip_mode[i_h264 < 9 ? i_h264 : 8];
++                    if( getenv("MOBI_8X8_MS") && ax > 0 && ay > 0 )
++                    {
++                        /* Choose the 8x8 direction on the 8x8 block itself (the 4x4 analysis' choice
++                         * for its top-left 4x4 fits the whole 8x8 poorly: keyframes came out ~10 dB
++                         * below their neighbours). Every candidate is the decoder-exact prediction;
++                         * the winner goes into the mode cache cavlc writes, so syntax and
++                         * reconstruction stay identical. */
++                        static const int cand[8] = { 0, 1, 3, 4, 5, 6, 7, 8 };
++                        int best = mobi_mode, bestc = 1 << 30;
++                        for( int k = 0; k < 8; k++ )
++                        {
++                            mobi_predict_8x8( h, p_dst, ax, ay, cand[k] );
++                            int sad = 0;
++                            for( int y = 0; y < 8; y++ )
++                                for( int x = 0; x < 8; x++ )
++                                    sad += abs( p_src[y*FENC_STRIDE+x] - p_dst[y*FDEC_STRIDE+x] );
++                            if( sad < bestc ) { bestc = sad; best = cand[k]; }
++                        }
++                        if( best != mobi_mode )
++                            for( int cm = 0; cm < 9; cm++ )
++                            {
++                                int hh = i2h[cm+1];
++                                if( hh < 9 && mobi_h264_to_mobiclip_mode[hh] == best )
++                                {
++                                    for( int s4 = 0; s4 < 4; s4++ )
++                                        h->mb.cache.intra4x4_pred_mode[x264_scan8[i8*4+s4]] = cm;
++                                    mobi_mode = best;
++                                    break;
++                                }
++                            }
++                    }
++                    mobi_predict_8x8( h, p_dst, ax, ay, mobi_mode );
++                    ALIGNED_ARRAY_64( dctcoef, dct8x8,[64] );
++                    h->dctf.sub8x8_dct8( dct8x8, p_src, p_dst );
++                    nz = mobi_quant_8x8( h, dct8x8, i_qp, 1 /*intra*/ );
++                    if( nz )
++                    {
++                        for( int i = 0; i < 64; i++ )
++                            h->dct.luma8x8[p*4+i8][i] = dct8x8[mobi_zigzag8x8[i]];
++                        int mat[64];
++                        for( int i = 0; i < 64; i++ )
++                            mat[i] = (int)dct8x8[i] * qtab[i];
++                        mobi_add8x8_idct8( p_dst, mat );
++                        h->mb.cache.non_zero_count[x264_scan8[p*16+i8*4]] = 1;
++                        h->mb.i_cbp_luma |= 1 << i8;
++                    }
++                }
++            }
++            h->mb.b_transform_8x8 = 1;
++            h->mb.i_type = I_8x8;
++        }
++        else
++#endif
+         for( int p = 0; p < plane_count; p++, i_qp = h->mb.i_qp )
+         {
+             for( int i = (p == 0 && h->mb.i_skip_intra) ? 15 : 0; i < 16; i++ )
+@@ -1346,7 +1694,23 @@ static ALWAYS_INLINE void macroblock_encode_internal( x264_t *h, int plane_count
+     {
+         mobi_v11_refine_motion( h );
+         mobi_motion_compensate( h );
++        static const char *trace_env = (const char *)-1; if( trace_env == (const char *)-1 ) trace_env = getenv( "MOBI_TRACE" );
++        if( trace_env )
++        {
++            int tx, ty, tf; sscanf( trace_env, "%d,%d,%d", &tx, &ty, &tf );
++            if( h->mb.i_mb_x == tx && h->mb.i_mb_y == ty && h->fenc->i_frame == tf )
++            {
++                fprintf( stderr, "[TRACE] after MC: type %d part %d mv (%d,%d) U row7:", h->mb.i_type, h->mb.i_partition,
++                         h->mb.cache.mv[0][x264_scan8[0]][0], h->mb.cache.mv[0][x264_scan8[0]][1] );
++                for( int x = 0; x < 8; x++ ) fprintf( stderr, " %d", h->mb.pic.p_fdec[1][7*FDEC_STRIDE+x] );
++                fprintf( stderr, "\n" );
++            }
++        }
+     }
++        /* 8x8 luma (MOBI_8X8): per-MB choice from mb_analyse_transform (RD); keep 4x4 wherever
++         * cavlc's use8x8 gate would not write 8x8, or the stream desyncs */
++        if( h->param.i_mobiclip && !x264_mb_transform_8x8_allowed( h ) )
++            h->mb.b_transform_8x8 = 0;
+ #endif
+ 
+         if( h->mb.b_lossless )
+@@ -1381,6 +1745,64 @@ static ALWAYS_INLINE void macroblock_encode_internal( x264_t *h, int plane_count
+             for( int p = 0; p < plane_count; p++ )
+                 CLEAR_16x16_NNZ( p );
+         }
++        else if( h->param.i_mobiclip && h->mb.b_transform_8x8 )
++        {
++            /* Mobiclip 8x8 inter luma residual — decoder-exact, mirrors the
++             * chroma template (mb_encode_chroma_internal): forward sub8x8_dct8
++             * -> mobi_quant_8x8 (LUMA mobi_q8 table) -> store coeffs via
++             * mobi_zigzag8x8 into luma8x8[] -> reconstruct with the decoder's
++             * exact mobi_add8x8_idct8.  cavlc's use8x8 branch emits the
++             * "idx==0" single-8x8 syntax the decoder's add_pframe_coefficients
++             * reads.  Only the per-8x8 representative nnz (scan8[i8*4]) is what
++             * cavlc consults, matching the chroma convention. */
++            for( int p = 0; p < plane_count; p++, i_qp = h->mb.i_qp )
++            {
++                CLEAR_16x16_NNZ( p );
++                int qx = i_qp % 6;
++                int qtab[64];
++                for( int zz = 0; zz < 64; zz++ )
++                    qtab[mobi_zigzag8x8[zz]] = (int)mobi_q8[qx][zz] << mobi_qyx( h );
++                for( int i8 = 0; i8 < 4; i8++ )
++                {
++                    int ox = 8*(i8&1), oy = 8*(i8>>1);
++                    pixel *p_src = h->mb.pic.p_fenc[p] + ox + oy*FENC_STRIDE;
++                    pixel *p_dst = h->mb.pic.p_fdec[p] + ox + oy*FDEC_STRIDE;
++                    ALIGNED_ARRAY_64( dctcoef, dct8x8,[64] );
++                    pixel lrd_pred[64];
++                    for( int yy = 0; yy < 8; yy++ ) memcpy( &lrd_pred[yy*8], &p_dst[yy*FDEC_STRIDE], 8*sizeof(pixel) );
++                    h->dctf.sub8x8_dct8( dct8x8, p_src, p_dst );
++                    nz = mobi_quant_8x8( h, dct8x8, i_qp, 0 /*inter*/ );
++                    if( nz )
++                    {
++                        for( int i = 0; i < 64; i++ )
++                            h->dct.luma8x8[p*4+i8][i] = dct8x8[mobi_zigzag8x8[i]];
++                        int mat[64];
++                        for( int i = 0; i < 64; i++ )
++                            mat[i] = (int)dct8x8[i] * qtab[i];
++                        mobi_add8x8_idct8( p_dst, mat );
++                        if( mobi_lrd_on() )
++                        {
++                            double lam = mobi_lrd_lambda( h, i_qp );
++                            int ssd_c = mobi_ssd8( p_src, p_dst, FDEC_STRIDE );
++                            int ssd_z = mobi_ssd8( p_src, lrd_pred, 8 );
++                            int bits = 1 + mobi_level_bits( h->dct.luma8x8[p*4+i8], 64 );
++                            if( ssd_z <= ssd_c + lam * bits )   /* not worth it: the prediction alone */
++                            {
++                                for( int yy = 0; yy < 8; yy++ ) memcpy( &p_dst[yy*FDEC_STRIDE], &lrd_pred[yy*8], 8*sizeof(pixel) );
++                                nz = 0;
++                            }
++                        }
++                    }
++                    if( nz )
++                    {
++                        h->mb.cache.non_zero_count[x264_scan8[p*16+i8*4]] = 1;
++                        h->mb.i_cbp_luma |= 1 << i8;
++                    }
++                    else
++                        h->mb.cache.non_zero_count[x264_scan8[p*16+i8*4]] = 0;
++                }
++            }
++        }
+         else if( h->param.i_mobiclip )
+         {
+             /* Inter luma residual.  x264's standard quant_4x4x4 + dequant_4x4 +
+@@ -1401,7 +1823,7 @@ static ALWAYS_INLINE void macroblock_encode_internal( x264_t *h, int plane_count
+                  * decodes whatever coefficient pattern we signal — so the
+                  * heuristic doesn't affect bit-exactness. */
+                 ALIGNED_ARRAY_16( pixel, save,[256] );
+-                if( b_decimate )
++                if( b_decimate || mobi_lrd_on() )
+                     for( int y = 0; y < 16; y++ )
+                         memcpy( save + y*16, h->mb.pic.p_fdec[p] + y*FDEC_STRIDE, 16*sizeof(pixel) );
+                 int i_decimate_p = 0;
+@@ -1444,9 +1866,34 @@ static ALWAYS_INLINE void macroblock_encode_internal( x264_t *h, int plane_count
+                         memcpy( h->mb.pic.p_fdec[p] + y*FDEC_STRIDE, save + y*16, 16*sizeof(pixel) );
+                 }
+                 else
++                {
++                    if( mobi_lrd_on() )
++                    {
++                        /* per 8x8 group: the four 4x4 residuals against the prediction alone */
++                        double lam = mobi_lrd_lambda( h, i_qp );
++                        for( int i8 = 0; i8 < 4; i8++ )
++                        {
++                            int ox = 8*(i8&1), oy = 8*(i8>>1), bits = 0, any = 0;
++                            for( int k4 = 0; k4 < 4; k4++ )
++                                if( h->mb.cache.non_zero_count[x264_scan8[p*16+i8*4+k4]] )
++                                { any = 1; bits += mobi_level_bits( h->dct.luma4x4[p*16+i8*4+k4], 16 ); }
++                            if( !any ) continue;
++                            bits += 3;   /* the 4x4 mask code */
++                            pixel *src = h->mb.pic.p_fenc[p] + ox + oy*FENC_STRIDE;
++                            pixel *rec = h->mb.pic.p_fdec[p] + ox + oy*FDEC_STRIDE;
++                            int ssd_c = mobi_ssd8( src, rec, FDEC_STRIDE );
++                            int ssd_z = mobi_ssd8( src, save + ox + oy*16, 16 );
++                            if( ssd_z <= ssd_c + lam * bits )
++                            {
++                                for( int y = 0; y < 8; y++ ) memcpy( rec + y*FDEC_STRIDE, save + ox + (oy+y)*16, 8*sizeof(pixel) );
++                                for( int k4 = 0; k4 < 4; k4++ ) h->mb.cache.non_zero_count[x264_scan8[p*16+i8*4+k4]] = 0;
++                            }
++                        }
++                    }
+                     for( int i4x4 = 0; i4x4 < 16; i4x4++ )
+                         if( h->mb.cache.non_zero_count[x264_scan8[p*16+i4x4]] )
+                             h->mb.i_cbp_luma |= 1 << (i4x4>>2);
++                }
+             }
+         }
+ #endif
+@@ -1652,6 +2099,19 @@ void x264_macroblock_encode( x264_t *h )
+     else
+         macroblock_encode_internal( h, 1, 0 );
+ 
++    static const char *trace_env = (const char *)-1; if( trace_env == (const char *)-1 ) trace_env = getenv( "MOBI_TRACE" );
++        if( trace_env )
++    {
++        int tx, ty, tf; sscanf( trace_env, "%d,%d,%d", &tx, &ty, &tf );
++        if( h->mb.i_mb_x == tx && h->mb.i_mb_y == ty && h->fenc->i_frame == tf )
++        {
++            fprintf( stderr, "[TRACE] after encode: type %d cbp L%x C%x nnzU %d nnzV %d U row7:", h->mb.i_type,
++                     h->mb.i_cbp_luma, h->mb.i_cbp_chroma, h->mb.cache.non_zero_count[x264_scan8[16]],
++                     h->mb.cache.non_zero_count[x264_scan8[32]] );
++            for( int x = 0; x < 8; x++ ) fprintf( stderr, " %d", h->mb.pic.p_fdec[1][7*FDEC_STRIDE+x] );
++            fprintf( stderr, "\n" );
++        }
++    }
+     if( getenv("MOBI_DBG") && h->mb.i_mb_x == 4 && h->mb.i_mb_y == 4 )
+     {
+         long se = 0, sd = 0;
+diff --git a/native/source/x264/encoder/macroblock.h b/native/source/x264/encoder/macroblock.h
+index 48b9ad2..438ab84 100644
+--- a/native/source/x264/encoder/macroblock.h
++++ b/native/source/x264/encoder/macroblock.h
+@@ -1081,6 +1081,130 @@ static void mobi_predict_4x4( x264_t *h, pixel *p_dst, int idx, int pmode )
+ }
+ #undef MPG
+ 
++/* Mobiclip 8x8 LUMA intra prediction — a faithful size-8 port of
++ * mobi_predict_4x4, matching the decoder's predict_intra(size=8) /
++ * intra_predict_fill for all directional modes (0,1,3,4-8).  Plane (mode 2) is
++ * handled at 16x16 MB granularity by the caller, exactly like the decoder's
++ * decode_macroblock, so it is not needed here.  ax/ay are the 8x8 block's frame
++ * coordinates; p_dst is the block's top-left in the fdec tile. */
++static ALWAYS_INLINE int mobi_pget8( x264_t *h, pixel *p_dst, int ax, int ay, int rx, int ry )
++{
++    const int size = 8;
++    if( rx == -1 && ry >= size )      { rx = -1; ry = size - 1; }
++    else if( rx >= -1 && ry >= -1 )   { /* keep */ }
++    else if( rx == -1 && ry == -2 )   { rx = 0; ry = -1; }
++    else if( rx == -2 && ry == -1 )   { rx = -1; ry = 0; }
++    int mb_x = h->mb.i_mb_x;
++    int mb_y = h->mb.i_mb_y;
++    int orig_x = ax + rx;
++    int orig_y = ay + ry;
++    int tx = orig_x; if( tx < 0 ) tx = 0; else if( tx > h->param.i_width - 1 ) tx = h->param.i_width - 1;
++    int ty = orig_y; if( ty < 0 ) ty = 0; else if( ty > h->param.i_height - 1 ) ty = h->param.i_height - 1;
++    int t_mb_x = tx / 16;
++    int t_mb_y = ty / 16;
++    if( t_mb_y < mb_y || (t_mb_y == mb_y && t_mb_x < mb_x) )
++        return h->fdec->plane[0][ ty * h->mb.pic.i_stride[0] + tx ];
++    else if( t_mb_y == mb_y && t_mb_x == mb_x )
++        return p_dst[ (ty - ay) * FDEC_STRIDE + (tx - ax) ];
++    else
++        return 128;
++}
++static void mobi_predict_8x8( x264_t *h, pixel *p_dst, int ax, int ay, int pmode )
++{
++    const int size = 8;
++    #define MPG8(rx,ry) mobi_pget8(h,p_dst,ax,ay,(rx),(ry))
++    #define HH8(xx,yy)  mobi_half3( MPG8((xx)-1,(yy)), MPG8((xx),(yy)), MPG8((xx)+1,(yy)) )
++    #define HV8(xx,yy)  mobi_half3( MPG8((xx),(yy)-1), MPG8((xx),(yy)), MPG8((xx),(yy)+1) )
++    if( pmode == 3 ) /* DC */
++    {
++        int fill;
++        if( ax == 0 && ay == 0 )
++            fill = 0x80;
++        else if( ax >= 1 && ay >= 1 )
++        {
++            int left = 0, top = 0;
++            for( int y = 0; y < size; y++ ) left += MPG8(-1, y);
++            for( int x = 0; x < size; x++ ) top  += MPG8(x, -1);
++            fill = ((left + top) * 2 / (2*size) + 1) / 2;
++        }
++        else if( ax >= 1 )
++        {
++            int left = 0;
++            for( int y = 0; y < size; y++ ) left += MPG8(-1, y);
++            fill = (left * 2 / size + 1) / 2;
++        }
++        else
++        {
++            int top = 0;
++            for( int x = 0; x < size; x++ ) top += MPG8(x, -1);
++            fill = (top * 2 / size + 1) / 2;
++        }
++        for( int y = 0; y < size; y++ )
++            for( int x = 0; x < size; x++ )
++                p_dst[y*FDEC_STRIDE + x] = fill;
++        return;
++    }
++    for( int y = 0; y < size; y++ )
++    {
++        for( int x = 0; x < size; x++ )
++        {
++            int val = 0;
++            switch( pmode )
++            {
++            case 0: val = MPG8(x, y-1); break;
++            case 1: val = MPG8(x-1, y); break;
++            case 4:
++                if( (x % 2) == 0 )
++                    val = mobi_half( MPG8(-1, y + x/2), MPG8(-1, y + x/2 + 1) );
++                else
++                    val = HV8( -1, y + x/2 + 1 );
++                break;
++            case 5:
++                if( x == 0 )      val = mobi_half( MPG8(-1, y-1), MPG8(-1, y) );
++                else if( y == 0 ) val = HH8( x-2, y-1 );
++                else if( x == 1 ) val = HV8( x-2, y-1 );
++                else              val = MPG8( x-2, y-1 );
++                break;
++            case 6:
++                if( y == 0 )      val = mobi_half( MPG8(x-1, -1), MPG8(x, -1) );
++                else if( x == 0 ) val = HV8( x-1, y-2 );
++                else if( y == 1 ) val = HH8( x-1, y-2 );
++                else              val = MPG8( x-1, y-2 );
++                break;
++            case 7:
++            {
++                int clr = MPG8(x-1, y-1);
++                if( x && y )
++                    val = clr;
++                else
++                {
++                    int acc1, acc2;
++                    if( x == 0 ) acc1 = MPG8(-1, y);
++                    else         acc1 = MPG8(x-2, -1);
++                    if( y == 0 ) acc2 = MPG8(x, -1);
++                    else         acc2 = MPG8(-1, y-2);
++                    val = mobi_half3( acc1, clr, acc2 );
++                }
++                break;
++            }
++            case 8:
++                if( y == 0 )           val = mobi_half( MPG8(x, -1), MPG8(x+1, -1) );
++                else if( y == 1 )      val = HH8( x+1, -1 );
++                else if( x < size-1 )  val = MPG8( x+1, y-2 );
++                else if( (y % 2) == 0 )val = mobi_half( MPG8(y/2 + size - 1, -1), MPG8(y/2 + size, -1) );
++                else                   val = HH8( y/2 + size, -1 );
++                break;
++            default: val = 0x80; break;
++            }
++            p_dst[y*FDEC_STRIDE + x] = val;
++        }
++    }
++    #undef MPG8
++    #undef HH8
++    #undef HV8
++}
++
++
+ /* Mobiclip chroma 8x8 prediction, matching the decoder's predict_intra(size=8)
+  * for the only modes the chroma-mode fix table can emit: 0=V, 1=H, 3=DC.
+  * Reads reconstructed neighbours from the fdec tile borders (populated by x264
+@@ -1239,6 +1363,11 @@ static ALWAYS_INLINE void x264_mb_encode_i4x4( x264_t *h, int p, int idx, int i_
+     int mobi_intra = (h->param.i_mobiclip && p == 0 && !b_predict &&
+                       mobi_v9_inter_luma_on() &&
+                       mobi_v9_inter_source_flat(h,p,idx)) ? 0 : 1;
++    /* MOBI_INTER4_DZ: an inter 4x4 (b_predict 0 = motion-compensated) block gets the INTER
++     * rounding (MOBI_DZ deadzone) -- it was quantized as intra (step/2, no deadzone), so the
++     * deadzone never reached half the P-frame luma blocks */
++    { static int i4dz = -1; if( i4dz < 0 ) { const char *e = getenv( "MOBI_INTER4_DZ" ); i4dz = e && atoi( e ) ? 1 : 0; }
++      if( i4dz && h->param.i_mobiclip && !b_predict ) mobi_intra = 0; }
+     nz = x264_quant_4x4( h, dct4x4, i_qp, ctx_cat_plane[DCT_LUMA_4x4][p], mobi_intra, p, idx );
+     h->mb.cache.non_zero_count[x264_scan8[p*16+idx]] = nz;
+ #if !HIGH_BIT_DEPTH
