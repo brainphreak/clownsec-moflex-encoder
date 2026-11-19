@@ -28,8 +28,16 @@ Usage:
   --audio-first        alternative to --strip-audio: keep the existing audio but move
                        it to stream 3 (bit patch); the --audio track takes stream 2
   --normalize          peak-normalize each provided WAV to -1 dBFS (loud, no clipping)
-  --trailer-audio x.wav  second language as a TRAILER after the last block (official player
-                         never reads it; ours plays it as Audio Track 2)
+  --trailer-audio x.wav  an extra language as a TRAILER after the last block (official player
+                         never reads it; ours plays it as Audio Track 2). REPEATABLE: tracks
+                         2, 3, ... in the order given (the player holds 7)
+  --trailer-lang XXX     label of the --trailer-audio just before it (or the next one)
+  --trailer-video alt.moflex  an alternate VIDEO version (VIDEO > Version in our player);
+                         REPEATABLE (up to 3). Same size, 2D/3D mode and timeline as the main
+                         one, and it should carry the same in-band track 1. Its trailer, if
+                         any, is dropped.
+  --trailer-video-label X  its name (up to 7 characters: B&W, COLOR) for the one just before
+  --main-label X         the main version's name in that menu
   --trailer-srt x.srt    subtitles in the trailer; REPEATABLE for multiple languages
                          (lang tag from '.eng.srt'-style names; first listed = default).
                          An .ass/.ssa goes in as-is: the player tells the formats apart by content.
@@ -50,6 +58,12 @@ everything extra lives past the final block:
     'AUD1' -> u32 rate, u16 channels, u16 samples/packet (1024), char lang[4] ("JPN"),
               then FIXED-SIZE ADPCM packets (in-band framing) -> seek = pure arithmetic
     'LNG0' -> char lang[4]: language of the IN-BAND audio track ("ENG")
+    AUD1 may repeat: one section per extra track, in order (Audio Track 2..8; the player holds 7).
+    'VID1' -> char label[8] + a complete block-only moflex: an alternate VIDEO version of the same
+              film (same size, 2D/3D mode and timeline; it carries the same in-band track 1). The
+              player opens it as its own demux window and switches with VIDEO > Version (up to 3).
+    'VLB0' -> char label[8]: the main (in-band) version's name in that menu.
+    (Moflex Studio and --trailer-audio / --trailer-video write these.)
   Languages auto-infer from ".xxx.wav" filenames; --lang / --trailer-lang override.
 """
 import array
@@ -331,13 +345,24 @@ def pack(groups, extra_desc, blocksize):
 
 # ---------------- main ----------------
 
+def label8(text):
+    """a video version's name: up to 7 bytes of UTF-8, NUL-padded to 8"""
+    b = (text or '').strip().encode('utf-8')[:7]
+    while b:
+        try:
+            b.decode('utf-8'); break
+        except UnicodeDecodeError:
+            b = b[:-1]
+    return b.ljust(8, b'\0')
+
 def main():
     args = sys.argv[1:]
     if len(args) < 2:
         print(__doc__); sys.exit(1)
     src, dst = args[0], args[1]
     wav_path = wav2_path = srt_path = None; audio_first = False; strip = False; norm = False
-    subtype = 4; tr_wav = None; tr_srts = []; lang_main = lang_alt = None
+    subtype = 4; tr_wavs = []; tr_srts = []; lang_main = None; pend_lang = None
+    tr_vids = []; pend_vlabel = None; main_label = None
     nfo_path = art_path = None
 
     def infer_lang(path):
@@ -359,13 +384,26 @@ def main():
         elif args[i] == '--strip-audio': strip = True; i += 1
         elif args[i] == '--normalize': norm = True; i += 1
         elif args[i] == '--subtype': subtype = int(args[i + 1]); i += 2
-        elif args[i] == '--trailer-audio': tr_wav = args[i + 1]; i += 2
+        elif args[i] == '--trailer-audio': tr_wavs.append([args[i + 1], pend_lang]); pend_lang = None; i += 2
         elif args[i] == '--trailer-srt': tr_srts.append(args[i + 1]); i += 2
         elif args[i] == '--lang': lang_main = args[i + 1][:3].upper(); i += 2
-        elif args[i] == '--trailer-lang': lang_alt = args[i + 1][:3].upper(); i += 2
+        elif args[i] == '--trailer-lang':                  # labels the track just before it (old usage),
+            lab = args[i + 1][:3].upper(); i += 2           # or the next one when none is waiting
+            if tr_wavs and tr_wavs[-1][1] is None: tr_wavs[-1][1] = lab
+            else: pend_lang = lab
+        elif args[i] == '--trailer-video': tr_vids.append([args[i + 1], pend_vlabel]); pend_vlabel = None; i += 2
+        elif args[i] == '--trailer-video-label':
+            lab = args[i + 1]; i += 2
+            if tr_vids and tr_vids[-1][1] is None: tr_vids[-1][1] = lab
+            else: pend_vlabel = lab
+        elif args[i] == '--main-label': main_label = args[i + 1]; i += 2
         elif args[i] == '--nfo': nfo_path = args[i + 1]; i += 2
         elif args[i] == '--art': art_path = args[i + 1]; i += 2
         else: print('unknown arg', args[i]); sys.exit(1)
+    if len(tr_wavs) > 7:
+        sys.exit(f'{len(tr_wavs)} trailer audio tracks -- the player holds 7 (plus the in-band one)')
+    if len(tr_vids) > 3:
+        sys.exit(f'{len(tr_vids)} trailer video versions -- the player holds 3 (plus the main one)')
 
     data = open(src, 'rb').read()
     groups, desc, blocksize, max_si = parse(data)
@@ -545,7 +583,20 @@ def main():
             w += nbytes
         print(f'  seek index: {patched}/{cnt} offsets remapped')
 
-    if tr_wav or tr_srts or nfo_path or art_path:
+    vids = []                                          # (label8, path, block-region length)
+    for vp, vl in tr_vids:
+        with open(vp, 'rb') as vf:
+            vf.seek(0, 2); vsz = vf.tell()
+            vf.seek(0); head = vf.read(2)
+            if head != b'\x4c\x32':
+                sys.exit(f'{vp} is not a moflex')
+            vlen = vsz
+            if vsz >= 16:
+                vf.seek(vsz - 16); ft = vf.read(16)
+                if ft[8:] == b'CSXTRA01':
+                    vlen = struct.unpack('<Q', ft[:8])[0]   # drop its own trailer: blocks only
+        vids.append((label8(vl or f'V{len(vids) + 2}'), vp, vlen))
+    if tr_wavs or tr_srts or nfo_path or art_path or vids:
         payload = bytearray()
         if nfo_path:
             nfo = open(nfo_path, 'rb').read()
@@ -570,18 +621,35 @@ def main():
             sl = (infer_lang_ext(ts_path) or 'SUB').encode()[:3].ljust(4, b'\0')
             payload += struct.pack('<4sI4s', b'SUB1', 4 + len(srt), sl) + srt
             print(f'  trailer subs [{sl.rstrip(chr(0).encode()).decode()}]: {len(srt)} B')
-        if tr_wav:
+        for tr_wav, tr_lang in tr_wavs:
             pcm, chn, rate = load_wav(tr_wav)
             total = len(pcm) // chn
             pad = (-total) % PKT_SAMPLES                 # pad tail with silence to a full packet
             pcm.extend(array.array('h', bytes(2 * pad * chn)))   # in place: no second copy
             apkts = adpcm_packets(pcm, chn, rate)
             blob = b''.join(pl for _, pl in apkts)
-            la = (lang_alt or infer_lang(tr_wav) or 'ALT').encode()[:3].ljust(4, b'\0')
+            la = (tr_lang or infer_lang(tr_wav) or 'ALT').encode()[:3].ljust(4, b'\0')
             payload += struct.pack('<4sIIHH4s', b'AUD1', 12 + len(blob), rate, chn, PKT_SAMPLES, la) + blob
-            print(f'  trailer audio [{la.rstrip(b"\0").decode()}]: {len(apkts)} packets @{rate}Hz x{chn} ({len(blob)} B)')
+            la_name = la.rstrip(b'\x00').decode()
+            print(f'  trailer audio [{la_name}]: {len(apkts)} packets @{rate}Hz x{chn} ({len(blob)} B)')
         base = len(out)
-        out += payload + struct.pack('<Q8s', base, b'CSXTRA01')
+        with open(dst, 'wb') as fo:                    # video versions stream from their files:
+            fo.write(out); fo.write(payload)           # a GB-sized alternate is never held in memory
+            for lab, vp, vlen in vids:
+                fo.write(struct.pack('<4sI', b'VID1', 8 + vlen) + lab)
+                with open(vp, 'rb') as vf:
+                    left = vlen
+                    while left > 0:
+                        b = vf.read(min(left, 8 << 20))
+                        if not b: sys.exit(f'{vp} ended early')
+                        fo.write(b); left -= len(b)
+                print(f'  video version [{lab.rstrip(bytes(1)).decode("utf-8", "replace")}]: {vlen} B from {vp.split("/")[-1]}')
+            if vids:
+                fo.write(struct.pack('<4sI', b'VLB0', 8) + label8(main_label or ''))
+            fo.write(struct.pack('<Q8s', base, b'CSXTRA01'))
+            total = fo.tell()
+        print(f'wrote {dst}: {total} B ({total - len(data):+} B)')
+        return
     open(dst, 'wb').write(out)
     print(f'wrote {dst}: {len(out)} B ({len(out)-len(data):+} B)')
 

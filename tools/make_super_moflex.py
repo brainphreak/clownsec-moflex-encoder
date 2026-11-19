@@ -22,11 +22,18 @@ Usage:
     --audio N        stream index for the IN-BAND track (the one the official player gets).
                      Without it the first eng-tagged track wins, which is wrong for a film
                      with no English dub but two English commentary tracks.
-    --audio2 N|none  stream index for the trailer (second) audio, or 'none' for no second track
-    --audio2-lang X  three-letter tag shown on the player's audio button for that track. Use it
+    --audio2 N|none  stream index for the trailer (second) audio, or 'none' for no second track.
+                     A comma list (--audio2 2,3,5) gives tracks 2, 3, 4... in that order (up to 7)
+    --audio2-lang X  three-letter tag shown on the player's audio button for that track (a comma
+                     list matches a comma list of --audio2). Use it
                      when the track is not what its language tag implies -- a COMMENTARY is
                      tagged eng, and labelling it ENG invites someone to press it expecting a
                      dub. COM says what it is.
+    --version F      an alternate VIDEO version, already a moflex (same size, 2D/3D mode and
+                     timeline -- e.g. a B&W master). Repeatable, up to 3. Its in-band audio is
+                     replaced with this build's track 1, so every audio track works with it.
+    --version-label X  its name in the player's VIDEO > Version row (up to 7 chars: B&W)
+    --main-label X   the main version's name in that row
     --art FILE       use this poster instead of the one TMDB would fetch
     --add-genres G   comma-separated genres to ADD to what TMDB reports (batch-safe;
                      duplicates are ignored), e.g. 'Studio Ghibli, Anime'
@@ -62,6 +69,10 @@ Usage:
     --title T        override the parsed title      --year Y   override the parsed year
     --yes            accept fetched info without prompting
     --no-net         skip TMDB (prompts for info; still builds audio/subs)
+    --info FILE      take the library info from this JSON file instead of TMDB and the prompts
+                     (keys: title year category genres runtime date desc showdesc eptitle).
+                     For front ends that search and edit the metadata themselves; with it the
+                     build asks nothing (pass --format, --3d/--2d and --art too).
 
 Requires: ffmpeg/ffprobe; moflex_addstreams.py, ass_to_srt.py and srt_clean.py beside this file.
 TMDB lookups need your own token: TMDB_TOKEN=... or ~/.config/moflex-encoder/tmdb_token.
@@ -219,6 +230,94 @@ def scrub(path):
         return f'clean failed: {ex}'
 
 
+def extract_normalized(src, stream_index, p, tag, offset=0.0):
+    """Extract one audio stream of `src` to a 44.1 kHz stereo 16-bit WAV at `p`, loudness-normalised.
+    `offset` slides it onto another timeline (see --offset). Shared with front ends."""
+    pre, post = [], []
+    if offset > 0:
+        post = ['-af', f'adelay={int(round(offset * 1000))}:all=1']
+    elif offset < 0:
+        pre = ['-ss', f'{-offset:.3f}']
+    if offset:
+        post += ['-t', f'{src_duration(src):.3f}']   # silence in at the head, same off the tail
+
+    # Extract and LOUDNESS-normalise, EBU R128 two-pass, I=-16 TP=-1.0 LRA=11.
+    #
+    # This is the same target smoflex_build.py uses, and the same the library was rebuilt to.
+    # It used to hand a raw WAV to moflex_addstreams --normalize, which peak-normalises to
+    # -1 dBFS -- a different thing entirely. Peak matches the loudest sample; loudness matches
+    # what a listener hears. A film with one loud explosion and quiet dialogue peak-normalises
+    # to quiet dialogue, and lands wherever it lands: Earthsea came out near -16 by luck and
+    # nothing was holding it there.
+    #
+    # Order matters: the downmix goes FIRST. `-ac 2` is an output option applied AFTER -af,
+    # so normalising then downmixing measures a different signal than the one written.
+    #
+    head = 'aformat=sample_rates=44100:channel_layouts=stereo'
+    ln = 'I=-16:TP=-1.0:LRA=11'
+    meas = subprocess.run(['ffmpeg', '-hide_banner', '-nostats'] + pre + ['-i', src,
+                           '-map', f'0:{stream_index}',
+                           '-af', f'{head},loudnorm={ln}:print_format=json',
+                           '-f', 'null', '-'], capture_output=True, text=True).stderr
+    m = re.search(r'\{[^{}]*"input_i"[^{}]*\}', meas, re.S)
+    chain = [head]
+    if m:
+        j = json.loads(m.group(0))
+        meas_i, meas_tp = float(j['input_i']), float(j['input_tp'])
+        # ONE constant gain, and never the loudnorm filter itself.
+        #
+        # loudnorm with linear=true silently FALLS BACK TO DYNAMIC compression whenever the
+        # gain needed to hit the target would breach the true-peak ceiling. The Wind Rises
+        # needed +8.63 dB from -24.63 LUFS but had only 4.01 dB of peak headroom, so it was
+        # compressed -- gain wandering between 1.97x and 4.33x within 90 seconds -- and that
+        # is audible as crackle on top of an ADPCM encode. Nobody asked for compression; the
+        # job is to change the VOLUME.
+        #
+        # So: take the smaller of "what reaches the target" and "what the peak allows". A
+        # film that cannot reach -16 LUFS without squashing simply ends up quieter, which is
+        # the right trade and is verifiable afterwards.
+        #
+        # And a FLOOR on the reduction. `room` goes negative on a hot master -- these
+        # Halloween masters measure +1.1 to +2.1 dBTP -- and the ceiling was then quietly
+        # turning the film DOWN by 2-3 dB, which is an audible loss on a handheld and puts
+        # it well below the rest of the library. The only real reason to keep any headroom
+        # is that IMA-ADPCM decode can overshoot a full-scale sample; that is worth a few
+        # tenths, not three decibels. -1.0 dBTP was inherited from the loudnorm TARGET,
+        # where it was a LIMITER ceiling, and it does not belong as a hard cap on a
+        # constant gain. Never attenuate by more than MAX_CUT.
+        want = -16.0 - meas_i
+        room = -1.0 - meas_tp
+        # Floor the PEAK constraint, not the result. max(min(want, room), MAX_CUT) also
+        # clamps a legitimate loudness REDUCTION: a master already at -7.7 LUFS wants
+        # -8.3 dB to reach the target and would have been held at -1.0, shipping ~7 dB
+        # louder than the library. Only `room` -- the true-peak ceiling -- may be floored.
+        gain = min(want, max(room, MAX_CUT))
+        chain.append(f'volume={gain:.2f}dB')
+        if abs(gain - MAX_CUT) < 0.01 and room < MAX_CUT <= want:
+            note = (f' (hot master {meas_tp:+.2f} dBTP; reduction held at {MAX_CUT:.1f} dB '
+                    f'instead of {room:+.2f})')
+        elif gain < want - 0.01:
+            note = f' (capped from {want:+.2f} by true peak)'
+        else:
+            note = ''
+        print(f'    gain {tag}: {meas_i:.2f} LUFS {gain:+.2f} dB -> {meas_i + gain:.2f} LUFS{note}')
+    else:
+        print(f'    gain {tag}: measurement failed -- leaving the level alone')
+    if post:
+        chain.append(post[1]) if post[0] == '-af' else None
+    chain.append('aresample=44100')
+    tail = [x for x in post if x not in ('-af',) and not x.startswith('adelay')]
+    subprocess.run(['ffmpeg', '-y', '-v', 'error'] + pre + ['-i', src,
+                    '-map', f'0:{stream_index}', '-af', ','.join(chain),
+                    '-ac', '2', '-ar', '44100'] + tail + ['-c:a', 'pcm_s16le', p], check=True)
+    import wave
+    with wave.open(p, 'rb') as h:
+        got = (h.getframerate(), h.getnchannels(), h.getsampwidth())
+    if got != (44100, 2, 2):
+        raise SystemExit(f'{tag}: wrote {got}, expected (44100, 2, 2)')
+    return p
+
+
 def ask(prompt, default, yes):
     if yes:
         return default
@@ -234,7 +333,9 @@ def main():
     offset = 0.0; sub_offset = 0.0
     o_format = None; o_3d = None
     a_main = a_second = None; o_art = None; a2_lang = None; tmdb_se = None; o_genres = ''
+    versions = []; main_label = None     # --version FILE [--version-label X], --main-label
     o_lang = None
+    o_info = None
     only_subs = None
     sub_labels = {}                      # --sub-label: stream index -> code shown on the player
     keep_ass = True                      # player 61008.1+ renders ASS/SSA; --flatten-ass opts out
@@ -251,11 +352,18 @@ def main():
         elif args[i] == '--keep-ass': keep_ass = True; i += 1
         elif args[i] == '--flatten-ass': keep_ass = False; i += 1
         elif args[i] == '--no-net': net = False; i += 1
+        elif args[i] == '--info': o_info = args[i + 1]; net = False; i += 2
         elif args[i] == '--format': o_format = args[i + 1]; i += 2
         elif args[i] == '--3d': o_3d = 1; i += 1
         elif args[i] == '--2d': o_3d = 0; i += 1
         elif args[i] == '--audio': a_main = int(args[i + 1]); i += 2
-        elif args[i] == '--audio2': a_second = int(args[i + 1]) if args[i+1] != 'none' else -1; i += 2
+        elif args[i] == '--audio2':
+            a_second = [int(x) for x in args[i + 1].split(',') if x.strip()] if args[i + 1] != 'none' else -1; i += 2
+        elif args[i] == '--version': versions.append([args[i + 1], None]); i += 2
+        elif args[i] == '--version-label':
+            if not versions: print('  --version-label goes after its --version'); sys.exit(1)
+            versions[-1][1] = args[i + 1]; i += 2
+        elif args[i] == '--main-label': main_label = args[i + 1]; i += 2
         elif args[i] == '--art': o_art = args[i + 1]; i += 2
         elif args[i] == '--add-genres': o_genres = args[i + 1]; i += 2
         elif args[i] == '--subs':
@@ -271,7 +379,7 @@ def main():
                     print(f'  --sub-label wants STREAM=CODE with a 2-3 character code starting with a letter, got {pair!r}'); sys.exit(1)
                 sub_labels[int(n)] = code
             i += 2
-        elif args[i] == '--audio2-lang': a2_lang = args[i + 1][:3].upper(); i += 2
+        elif args[i] == '--audio2-lang': a2_lang = [x.strip()[:3].upper() for x in args[i + 1].split(',')]; i += 2
         elif args[i] == '--lang': o_lang = args[i + 1][:3].lower(); i += 2
         elif args[i] == '--tmdb-se':
             _s, _e = args[i + 1].split(':'); tmdb_se = (int(_s), int(_e)); i += 2
@@ -299,115 +407,40 @@ def main():
         a_eng = by_index.get(a_main)
         if a_eng is None:
             print(f'  --audio {a_main} is not an audio stream in this file'); sys.exit(1)
-        if a_second == -1:   a_orig = None
+        if a_second == -1:   a_origs = []
         elif a_second is not None:
-            a_orig = by_index.get(a_second)
-            if a_orig is None:
-                print(f'  --audio2 {a_second} is not an audio stream'); sys.exit(1)
-        else: a_orig = next((s for s in audio if s is not a_eng), None)
+            a_origs = []
+            for n in a_second:
+                if by_index.get(n) is None:
+                    print(f'  --audio2 {n} is not an audio stream'); sys.exit(1)
+                a_origs.append(by_index[n])
+        else: a_origs = [s for s in audio if s is not a_eng][:1]
     else:
         a_eng = next((s for s in audio if s.get('tags', {}).get('language') == 'eng'), None)
-        a_orig = next((s for s in audio if s is not a_eng), None)
+        a_origs = [s for s in audio if s is not a_eng][:1]
     if not a_eng:
-        a_eng, a_orig = (audio[0], None) if audio else (None, None)
+        a_eng, a_origs = (audio[0], []) if audio else (None, [])
         print('  NOTE: no eng-tagged audio; using the first track in-band, no second track')
     if not a_eng:
         print('  ERROR: source has no audio'); sys.exit(1)
-    orig_lang = (a_orig.get('tags', {}).get('language', 'und')[:3].upper() if a_orig else None)
-    if a2_lang: orig_lang = a2_lang   # what it IS, not what it is tagged
+    if len(a_origs) > 7:
+        print(f'  ERROR: {len(a_origs)} extra audio tracks -- the player holds 7 besides track 1'); sys.exit(1)
+    if len(versions) > 3:
+        print(f'  ERROR: {len(versions)} video versions -- the player holds 3 besides the main one'); sys.exit(1)
+    orig_langs = [a.get('tags', {}).get('language', 'und')[:3].upper() for a in a_origs]
+    for k, lab in enumerate(a2_lang or []):   # what it IS, not what it is tagged
+        if k < len(orig_langs) and lab: orig_langs[k] = lab
 
     # ---- extract audio ----
     # --offset slides everything taken from the source onto the encode's timeline, for the case
     # where the encode did NOT come from this exact file (a master with a longer head, etc).
     # Measure it, never guess: cross-correlate the encode's own audio (pc_verify/test_audio
     # dumps it) against the source track -- Howl's needed +14.446 s, flat across the whole film.
-    pre, post = [], []
-    if offset > 0:
-        post = ['-af', f'adelay={int(round(offset * 1000))}:all=1']
-    elif offset < 0:
-        pre = ['-ss', f'{-offset:.3f}']
-    if offset:
-        post += ['-t', f'{src_duration(src):.3f}']   # silence in at the head, same off the tail
-
     def wav(stream, tag):
-        """Extract and LOUDNESS-normalise, EBU R128 two-pass, I=-16 TP=-1.0 LRA=11.
-
-        This is the same target smoflex_build.py uses, and the same the library was rebuilt to.
-        It used to hand a raw WAV to moflex_addstreams --normalize, which peak-normalises to
-        -1 dBFS -- a different thing entirely. Peak matches the loudest sample; loudness matches
-        what a listener hears. A film with one loud explosion and quiet dialogue peak-normalises
-        to quiet dialogue, and lands wherever it lands: Earthsea came out near -16 by luck and
-        nothing was holding it there.
-
-        Order matters: the downmix goes FIRST. `-ac 2` is an output option applied AFTER -af,
-        so normalising then downmixing measures a different signal than the one written.
-        """
         p = os.path.join(work, f'audio.{tag}.wav')
         if os.path.exists(p):
             return p
-        head = 'aformat=sample_rates=44100:channel_layouts=stereo'
-        ln = 'I=-16:TP=-1.0:LRA=11'
-        meas = subprocess.run(['ffmpeg', '-hide_banner', '-nostats'] + pre + ['-i', src,
-                               '-map', f"0:{stream['index']}",
-                               '-af', f'{head},loudnorm={ln}:print_format=json',
-                               '-f', 'null', '-'], capture_output=True, text=True).stderr
-        m = re.search(r'\{[^{}]*"input_i"[^{}]*\}', meas, re.S)
-        chain = [head]
-        if m:
-            j = json.loads(m.group(0))
-            meas_i, meas_tp = float(j['input_i']), float(j['input_tp'])
-            # ONE constant gain, and never the loudnorm filter itself.
-            #
-            # loudnorm with linear=true silently FALLS BACK TO DYNAMIC compression whenever the
-            # gain needed to hit the target would breach the true-peak ceiling. The Wind Rises
-            # needed +8.63 dB from -24.63 LUFS but had only 4.01 dB of peak headroom, so it was
-            # compressed -- gain wandering between 1.97x and 4.33x within 90 seconds -- and that
-            # is audible as crackle on top of an ADPCM encode. Nobody asked for compression; the
-            # job is to change the VOLUME.
-            #
-            # So: take the smaller of "what reaches the target" and "what the peak allows". A
-            # film that cannot reach -16 LUFS without squashing simply ends up quieter, which is
-            # the right trade and is verifiable afterwards.
-            #
-            # And a FLOOR on the reduction. `room` goes negative on a hot master -- these
-            # Halloween masters measure +1.1 to +2.1 dBTP -- and the ceiling was then quietly
-            # turning the film DOWN by 2-3 dB, which is an audible loss on a handheld and puts
-            # it well below the rest of the library. The only real reason to keep any headroom
-            # is that IMA-ADPCM decode can overshoot a full-scale sample; that is worth a few
-            # tenths, not three decibels. -1.0 dBTP was inherited from the loudnorm TARGET,
-            # where it was a LIMITER ceiling, and it does not belong as a hard cap on a
-            # constant gain. Never attenuate by more than MAX_CUT.
-            want = -16.0 - meas_i
-            room = -1.0 - meas_tp
-            # Floor the PEAK constraint, not the result. max(min(want, room), MAX_CUT) also
-            # clamps a legitimate loudness REDUCTION: a master already at -7.7 LUFS wants
-            # -8.3 dB to reach the target and would have been held at -1.0, shipping ~7 dB
-            # louder than the library. Only `room` -- the true-peak ceiling -- may be floored.
-            gain = min(want, max(room, MAX_CUT))
-            chain.append(f'volume={gain:.2f}dB')
-            if abs(gain - MAX_CUT) < 0.01 and room < MAX_CUT <= want:
-                note = (f' (hot master {meas_tp:+.2f} dBTP; reduction held at {MAX_CUT:.1f} dB '
-                        f'instead of {room:+.2f})')
-            elif gain < want - 0.01:
-                note = f' (capped from {want:+.2f} by true peak)'
-            else:
-                note = ''
-            print(f'    gain {tag}: {meas_i:.2f} LUFS {gain:+.2f} dB -> {meas_i + gain:.2f} LUFS{note}')
-        else:
-            print(f'    gain {tag}: measurement failed -- leaving the level alone')
-        if post:
-            chain.append(post[1]) if post[0] == '-af' else None
-        chain.append('aresample=44100')
-        tail = [x for x in post if x not in ('-af',) and not x.startswith('adelay')]
-        subprocess.run(['ffmpeg', '-y', '-v', 'error'] + pre + ['-i', src,
-                        '-map', f"0:{stream['index']}", '-af', ','.join(chain),
-                        '-ac', '2', '-ar', '44100'] + tail + ['-c:a', 'pcm_s16le', p], check=True)
-        import wave
-        with wave.open(p, 'rb') as h:
-            got = (h.getframerate(), h.getnchannels(), h.getsampwidth())
-        if got != (44100, 2, 2):
-            raise SystemExit(f'{tag}: wrote {got}, expected (44100, 2, 2)')
-        return p
+        return extract_normalized(src, stream['index'], p, tag, offset)
     main_lang = (a_eng.get('tags', {}).get('language', 'eng')[:3].lower() if a_eng else 'eng')
     # An MP4 rip usually carries no language tag at all and ffprobe reports 'und'. Shipping that
     # puts UND on the player's audio button for what is plainly the English track, so an explicit
@@ -418,8 +451,8 @@ def main():
         main_lang = 'eng'
         print("  NOTE: source tags its audio 'und'; tagging the in-band track ENG")
     eng_wav = wav(a_eng, main_lang)
-    orig_wav = wav(a_orig, orig_lang.lower()) if a_orig else None
-    print(f'  audio: eng ok' + (f', {orig_lang} ok' if orig_wav else ''))
+    orig_wavs = [(wav(a, f'{lab.lower()}.t{k + 2}'), lab) for k, (a, lab) in enumerate(zip(a_origs, orig_langs))]
+    print(f'  audio: eng ok' + ''.join(f', {lab} ok' for _, lab in orig_wavs))
 
     for n in sorted(sub_labels):
         st = next((x for x in subs if x['index'] == n), None)
@@ -619,6 +652,18 @@ def main():
                       '      If TMDB numbers this show continuously, pass --tmdb-se S:E.')
                 sys.exit(2)
 
+    if o_info:
+        # a front end already chose and edited the info: take it as given, ask nothing
+        with open(o_info, encoding='utf-8') as f:
+            given = json.load(f)
+        for k in ('title', 'year', 'category', 'genres', 'runtime', 'date', 'desc', 'showdesc', 'eptitle'):
+            if k in given and given[k] is not None:
+                info[k] = given[k]
+        info['year'] = int(info['year'] or 0)
+        info['runtime'] = int(info['runtime'] or 0)
+        yes = True
+        print(f"  info: {info['title']} ({info['year']})  {info['genres']}  {info['runtime']}min  [from --info]")
+
     # ---- confirm / fill in ----
     info['title'] = ask('Title', info['title'], yes)
     info['year'] = int(ask('Year', info['year'], yes) or 0)
@@ -693,8 +738,30 @@ def main():
     cmd = [sys.executable, ADDSTREAMS, enc, out,
            '--strip-audio', '--audio', eng_wav,
            '--lang', main_lang.upper(), '--nfo', nfo]
-    if orig_wav:
-        cmd += ['--trailer-audio', orig_wav, '--trailer-lang', orig_lang]
+    for w, lab in orig_wavs:
+        cmd += ['--trailer-audio', w, '--trailer-lang', lab]
+    for k, (vp, vl) in enumerate(versions):
+        # the alternate carries THIS build's track 1, so switching versions keeps the sound in step;
+        # its own trailer (if any) is dropped first -- addstreams only parses the block region
+        import struct as _st
+        vb = os.path.join(work, f'version{k + 2}.blocks.moflex')
+        with open(vp, 'rb') as vf:
+            vf.seek(0, 2); vsz = vf.tell(); vlen = vsz
+            if vsz >= 16:
+                vf.seek(vsz - 16); ft = vf.read(16)
+                if ft[8:] == b'CSXTRA01': vlen = _st.unpack('<Q', ft[:8])[0]
+            vf.seek(0)
+            with open(vb, 'wb') as fo:
+                left = vlen
+                while left > 0:
+                    b = vf.read(min(left, 8 << 20)); fo.write(b); left -= len(b)
+        va = os.path.join(work, f'version{k + 2}.moflex')
+        print(f'  version {k + 2}: {os.path.basename(vp)} -- giving it track 1')
+        subprocess.run([sys.executable, ADDSTREAMS, vb, va, '--strip-audio', '--audio', eng_wav], check=True)
+        os.remove(vb)
+        cmd += ['--trailer-video', va] + (['--trailer-video-label', vl] if vl else [])
+    if versions and main_label:
+        cmd += ['--main-label', main_label]
     for c, p in srt_files:
         # the player skips a SUB section over 1 MiB without a word: the track just never shows
         # in its menu (a raw karaoke ASS hit this at 1.4 MB; cleaned it is ~40 KB)
@@ -708,15 +775,19 @@ def main():
     subprocess.run(cmd, check=True)
     # ---- post-write verification: a NAS/SMB flake once zeroed part of a trailer ----
     import struct as _st
-    data = open(out, 'rb').read()
-    assert data[-8:] == b'CSXTRA01', 'footer missing after write'
-    poff = _st.unpack('<Q', data[-16:-8])[0]
-    p2 = poff; known = {b'NFO0', b'ART5', b'LNG0', b'SUB0', b'SUB1', b'AUD0', b'AUD1'}
-    while p2 + 8 <= len(data) - 16:
-        cc = bytes(data[p2:p2 + 4]); ln = _st.unpack('<I', data[p2 + 4:p2 + 8])[0]
-        assert cc in known, f'corrupt trailer section at {p2}'
-        p2 += 8 + ln
-    assert p2 == len(data) - 16, 'trailer walk did not land on the footer'
+    # (walked header by header: with video versions the file can be gigabytes)
+    with open(out, 'rb') as vf:
+        vf.seek(0, 2); dlen = vf.tell()
+        vf.seek(dlen - 16); ft = vf.read(16)
+        assert ft[8:] == b'CSXTRA01', 'footer missing after write'
+        poff = _st.unpack('<Q', ft[:8])[0]
+        p2 = poff; known = {b'NFO0', b'ART5', b'LNG0', b'SUB0', b'SUB1', b'AUD0', b'AUD1', b'VID1', b'VLB0'}
+        while p2 + 8 <= dlen - 16:
+            vf.seek(p2); h = vf.read(8)
+            cc = h[:4]; ln = _st.unpack('<I', h[4:8])[0]
+            assert cc in known, f'corrupt trailer section at {p2}'
+            p2 += 8 + ln
+    assert p2 == dlen - 16, 'trailer walk did not land on the footer'
     print('  verified: trailer sections intact')
     # the full-size poster travels NEXT TO the movie, same name, .jpg extension
     if info['poster'] and os.path.exists(info['poster']):
