@@ -7,20 +7,38 @@ Encoder.
 ## The problem
 
 The official encoder compresses well, but its **final file-write stage is
-single-threaded and O(n²)**: after the (fast, multi-core) encode passes finish at
-99%, a lone thread inside `MobiclipEncoder.dll` grinds for **hours** assembling the
-output — one core pegged, disk and the other 31 cores idle. A feature-length movie
-can take **6+ hours** to write after a ~12-minute encode (observed: 3 h and still
-going at 794 MB). It reproduces on every machine; it is not disk, RAM, antivirus, or
-timer-resolution related, and the tool is closed-source so it can't be patched.
+single-threaded**: after the (fast, multi-core) encode passes finish at 99%, a lone
+thread inside `MobiclipEncoder.dll` grinds for a long time assembling the output, with
+one core pegged and the others idle. Its time grows faster than linearly with length, so a
+feature-length movie can sit at 99% for **hours** after a ~12-minute encode.
 
-## The fix: split → encode in parallel → combine
+## The fix: give the encoder video only, add the audio afterwards
 
-Because the crawl scales with the *square* of length, cutting the movie into `k`
-pieces makes each piece's finalize `(n/k)²` — and the pieces can encode **at the same
-time** (the single-instance limit is only in the GUI shell; run copies via Sandboxie /
-separate sessions / VMs). `k` parts ⇒ up to a **`k²` wall-clock speedup**
-(6 hours → ~10 minutes for 6 parts), then the parts are joined back into **one file**.
+The slow final write comes from **muxing the audio**. Feed the encoder a **lossless AVI
+with no audio track** and the 99% stage takes seconds, so a whole movie encodes in
+about **3–4 minutes** on a desktop CPU. Add the audio to the finished `.moflex`
+afterwards (3DS ADPCM, written in-band). This is how
+Moflex Studio builds every file. Thanks to
+**lenn3** for discovering it.
+
+```
+source.mkv ──ffmpeg──▶ video-only lossless AVI (x264 qp 0, 400x240 per eye; 3D = 800x240 SBS)
+                        │  official encoder (GUI, or headless: MobiclipMulticoreEncoder.exe -q job.queue)
+                        ▼
+                  video-only .moflex   (99% stage: seconds)
+                        │  add track 1 audio (ADPCM) in-band
+                        ▼
+                     movie.moflex
+```
+
+## Optional: split → encode in parallel → combine
+
+The no-audio fix is all most people need. Splitting is still useful to spread one movie
+over several machines or encoder instances. Cut the source into `k` pieces, encode them **at
+the same time** (the single-instance limit is only in the GUI shell; run copies via
+Sandboxie / separate sessions / VMs), then join the parts back into **one file**. With
+audio still in the job, splitting also shrinks each piece's slow final write. That was the
+original workaround, before the no-audio fix was found.
 
 ```
 source.mp4  ──split──▶  chunk_00.mp4 … chunk_k.mp4
@@ -47,9 +65,9 @@ happen at the container-block level instead — which is what `moflex_combine.py
 python3 tools/moflex_split.py source_sbs.mp4 chunks/ --parts 6
 
 # 2. encode EACH chunk to .moflex with the Nintendo Mobiclip GUI.
-#    Each chunk is small, so its O(n^2) finalize is fast; run several at once via
-#    Sandboxie / separate Windows sessions (the single-instance lock is only in the
-#    GUI shell) for the full k^2 speedup.  ->  chunk_000.moflex ... chunk_005.moflex
+#    (Strip the audio from each chunk first for the fast 99% stage; see "The fix".)
+#    Run several at once via Sandboxie / separate Windows sessions (the
+#    single-instance lock is only in the GUI shell).  ->  chunk_000.moflex ... chunk_005.moflex
 
 # 3. join the encoded segments into one file — lossless, audio + 3D intact
 python3 tools/moflex_combine.py combine movie.moflex \
