@@ -22,6 +22,9 @@ All of it is behind environment switches; with none set, output is byte-identica
 - `MOBI_KEY_DQ=n`, `MOBI_LRD=1`, `MOBI_LAMBDA_FULLQ=1` — experiments (see the notes in the code)
 - the x264 reconstruction dump (`dump-yuv`) writes MobiClip's planar chroma correctly, so encoder output
   can be checked against a decoder byte for byte
+- the `MOBI_*` switches are read once (a cached `getenv`): the encoder looked them up inside its
+  per-macroblock loops, and Windows' C runtime locks and walks the whole environment on every call --
+  the Windows build ran at half its speed (no change to the output)
 
 Measured against the official encoder (Nintendo's) on dark film and checked on Old 3DS hardware; every
 switch combination Big Top uses reconstructs exactly what the 3DS decoder does.

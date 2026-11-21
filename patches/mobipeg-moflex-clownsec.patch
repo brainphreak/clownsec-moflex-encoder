@@ -1,3 +1,63 @@
+diff --git a/native/source/x264/common/base.c b/native/source/x264/common/base.c
+index 36866be..3a684bd 100644
+--- a/native/source/x264/common/base.c
++++ b/native/source/x264/common/base.c
+@@ -98,6 +98,37 @@ void x264_log_internal( int i_level, const char *psz_fmt, ... )
+     va_end( arg );
+ }
+ 
++/****************************************************************************
++ * x264_getenv_cached: see base.h
++ ****************************************************************************/
++#undef getenv
++#define GETENV_SLOTS 512
++static struct { const char *key; char *val; int ready; } getenv_slot[GETENV_SLOTS];
++char *x264_getenv_cached( const char *name )
++{
++    uintptr_t h = ((uintptr_t)name >> 3) * 2654435761u;
++    for( int n = 0; n < GETENV_SLOTS; n++ )
++    {
++        int i = (int)((h + n) % GETENV_SLOTS);
++        const char *k = __atomic_load_n( &getenv_slot[i].key, __ATOMIC_ACQUIRE );
++        if( k == name )
++            return __atomic_load_n( &getenv_slot[i].ready, __ATOMIC_ACQUIRE ) ? getenv_slot[i].val : getenv( name );
++        if( !k )
++        {
++            const char *expect = NULL;
++            if( __atomic_compare_exchange_n( &getenv_slot[i].key, &expect, name, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ) )
++            {
++                getenv_slot[i].val = getenv( name );
++                __atomic_store_n( &getenv_slot[i].ready, 1, __ATOMIC_RELEASE );
++                return getenv_slot[i].val;
++            }
++            if( expect == name )
++                return getenv( name );
++        }
++    }
++    return getenv( name );   /* table full: uncached */
++}
++
+ /****************************************************************************
+  * x264_malloc:
+  ****************************************************************************/
+diff --git a/native/source/x264/common/base.h b/native/source/x264/common/base.h
+index 3e4d23d..5b7d208 100644
+--- a/native/source/x264/common/base.h
++++ b/native/source/x264/common/base.h
+@@ -48,6 +48,13 @@
+ #include <assert.h>
+ #include <limits.h>
+ 
++/* getenv, cached. The encoder reads its MOBI_* settings with getenv() inside the per-macroblock
++ * loops; Windows' C runtime takes a lock and walks the whole environment on every call, which
++ * made the Windows build ~3.6x slower than the Linux one on the same CPU. The environment does
++ * not change while encoding, so each name is looked up once (keyed by the literal's address). */
++char *x264_getenv_cached( const char *name );
++#define getenv(n) x264_getenv_cached(n)
++
+ /****************************************************************************
+  * Macros
+  ****************************************************************************/
 diff --git a/native/source/x264/common/common.h b/native/source/x264/common/common.h
 index 199ce51..86f613d 100644
 --- a/native/source/x264/common/common.h
