@@ -1,3 +1,353 @@
+diff --git a/native/source/ffmpeg/libavcodec/libx264.c b/native/source/ffmpeg/libavcodec/libx264.c
+index 9a625c7..56ce8bc 100644
+--- a/native/source/ffmpeg/libavcodec/libx264.c
++++ b/native/source/ffmpeg/libavcodec/libx264.c
+@@ -31,6 +31,7 @@
+ #include "libavutil/stereo3d.h"
+ #include "libavutil/time.h"
+ #include "libavutil/video_hint.h"
++#include "libavutil/thread.h"
+ #include "avcodec.h"
+ #include "codec_internal.h"
+ #include "encode.h"
+@@ -62,6 +63,22 @@ typedef struct X264Opaque {
+     AVBufferRef *frame_opaque_ref;
+ } X264Opaque;
+ 
++/* MOBI_DUAL_EYES=1 (3D moflex): the input alternates left, right, left, right... and each eye
++ * gets its own x264 encoder, run side by side on two threads -- twice the speed on two cores.
++ * Each eye references only its own previous picture, two back in the decoder's list
++ * (MOBI_REF_STRIDE=2, set here), which also compresses better than the one-encoder stream,
++ * whose right eye referenced the left. A P frame's quantizer is coded as a change from the
++ * frame before it in the stream -- the other eye -- so each P frame's header is rewritten to
++ * the change from the other eye's quantizer. Keyframes come at fixed spacing, the same in both
++ * eyes (no scene-cut keyframes), so a seek always lands on a keyframe pair. */
++typedef struct DualJob {
++    x264_t         *enc;
++    x264_picture_t  pic, out;
++    x264_nal_t     *nal;
++    int             nnal, ret;
++    AVFrame        *frame;      /* the input, kept alive while the encoder reads it */
++} DualJob;
++
+ typedef struct X264Context {
+     AVClass        *class;
+     x264_param_t    params;
+@@ -131,6 +148,15 @@ typedef struct X264Context {
+     int i_mobi_qyx;
+     int b_mobi_pktdbg;
+     int b_mobi_dbg;
++
++    int        dual;            /* MOBI_DUAL_EYES */
++    x264_t    *enc2;            /* the right eye's encoder */
++    int64_t    dual_n;          /* input frames so far (even = left, odd = right) */
++    int        dual_qp_eye[2], dual_qp_stream;
++    AVPacket  *dual_pending;    /* the right eye's packet, sent on the next call */
++    DualJob    job[2];
++    pthread_t  dual_thread;
++    int        dual_running;
+ } X264Context;
+ 
+ static void X264_log(void *p, int level, const char *fmt, va_list args)
+@@ -617,6 +643,227 @@ fail:
+     return ret;
+ }
+ 
++static void *dual_worker(void *arg)
++{
++    DualJob *j = arg;
++    j->ret = x264_encoder_encode(j->enc, &j->nal, &j->nnal, &j->pic, &j->out);
++    return NULL;
++}
++
++static int dual_bit(const uint8_t *b, int64_t n)
++{
++    return (b[n >> 3] >> (7 - (n & 7))) & 1;
++}
++
++static void dual_put(uint8_t *b, int64_t *n, unsigned v, int bits)
++{
++    for (int i = bits - 1; i >= 0; i--, (*n)++)
++        if ((v >> i) & 1)
++            b[*n >> 3] |= 0x80 >> (*n & 7);
++}
++
++static void dual_put_se(uint8_t *b, int64_t *n, int v)
++{
++    unsigned k = v > 0 ? 2u * v - 1 : -2u * v, x = k + 1;
++    int len = av_log2(x);
++    dual_put(b, n, 0, len);
++    dual_put(b, n, x, len + 1);
++}
++
++/* One frame's MobiClip data (16-bit little-endian words of a big-endian bit string): note its
++ * quantizer, and for a P frame recode the change against the stream's previous frame (the
++ * other eye). Returns 1 with a new buffer in *out, 0 when nothing changed, <0 on bad data. */
++static int dual_fix_qp(X264Context *x4, int eye, const uint8_t *le, int len,
++                       uint8_t **out, int *out_len)
++{
++    if (len < 2)
++        return AVERROR_INVALIDDATA;
++    uint8_t *be = av_malloc(len + 1);
++    if (!be)
++        return AVERROR(ENOMEM);
++    for (int i = 0; i + 1 < len; i += 2) { be[i] = le[i + 1]; be[i + 1] = le[i]; }
++    if (len & 1) be[len - 1] = le[len - 1];
++    int64_t nbits = 8LL * len, pos = 1;
++    if (dual_bit(be, 0)) {                       /* keyframe: the quantizer itself, 6 bits */
++        int qp = 0;
++        for (int i = 3; i < 9; i++) qp = qp * 2 + dual_bit(be, i);
++        x4->dual_qp_eye[eye] = x4->dual_qp_stream = qp;
++        av_free(be);
++        return 0;
++    }
++    int z = 0;
++    while (pos < nbits && !dual_bit(be, pos)) { z++; pos++; }
++    if (pos + z >= nbits || z > 16) { av_free(be); return AVERROR_INVALIDDATA; }
++    pos++;
++    unsigned k = (1u << z) - 1;
++    for (int i = 0; i < z; i++, pos++) k += (unsigned)dual_bit(be, pos) << (z - 1 - i);
++    int d  = (k & 1) ? (int)((k + 1) / 2) : -(int)(k / 2);
++    int qp = x4->dual_qp_eye[eye] + d;
++    int nd = qp - x4->dual_qp_stream;
++    x4->dual_qp_eye[eye] = x4->dual_qp_stream = qp;
++    if (nd == d) { av_free(be); return 0; }
++    int64_t rest = nbits - pos;
++    int nlen = (int)((1 + 2 * 32 + 1 + rest + 7) / 8);
++    uint8_t *nb = av_mallocz(nlen + 2);
++    if (!nb) { av_free(be); return AVERROR(ENOMEM); }
++    int64_t n = 1;                                /* P frame: a 0 bit */
++    dual_put_se(nb, &n, nd);
++    for (int64_t i = 0; i < rest; i++, n++)
++        if (dual_bit(be, pos + i))
++            nb[n >> 3] |= 0x80 >> (n & 7);
++    nlen = (int)((n + 15) / 16) * 2;              /* whole 16-bit words */
++    for (int i = 0; i < nlen; i += 2) { uint8_t t = nb[i]; nb[i] = nb[i + 1]; nb[i + 1] = t; }
++    av_free(be);
++    *out = nb; *out_len = nlen;
++    return 1;
++}
++
++/* A finished eye's output as an AVPacket, its quantizer change fixed for the stream. */
++static int dual_packet(AVCodecContext *ctx, AVPacket *pkt, DualJob *j, int eye)
++{
++    X264Context *x4 = ctx->priv_data;
++    x264_nal_t nals[16];
++    uint8_t *fixed = NULL;
++    int nn = FFMIN(j->nnal, 16), ret;
++    X264Opaque *out_opaque;
++
++    if (j->ret < 0)
++        return AVERROR_EXTERNAL;
++    if (!nn)
++        return 0;
++    memcpy(nals, j->nal, nn * sizeof(*nals));
++    for (int i = 0; i < nn; i++) {
++        if (nals[i].i_type != 1 && nals[i].i_type != 5)
++            continue;
++        const uint8_t *p = nals[i].p_payload;
++        int sz = nals[i].i_payload, sc;
++        if (sz >= 4 && !p[0] && !p[1] && p[2] == 1) sc = 3;
++        else if (sz >= 5 && !p[0] && !p[1] && !p[2] && p[3] == 1) sc = 4;
++        else sc = -4;                             /* a 4-byte size field */
++        int off = FFABS(sc) + 1;                  /* + the NAL header byte */
++        uint8_t *nb; int nlen;
++        ret = dual_fix_qp(x4, eye, p + off, sz - off, &nb, &nlen);
++        if (ret < 0)
++            return ret;
++        if (ret > 0) {
++            fixed = av_malloc(off + nlen);
++            if (!fixed) { av_free(nb); return AVERROR(ENOMEM); }
++            memcpy(fixed, p, off);
++            memcpy(fixed + off, nb, nlen);
++            av_free(nb);
++            if (sc < 0)
++                AV_WB32(fixed, nlen + 1);
++            nals[i].p_payload = fixed;
++            nals[i].i_payload = off + nlen;
++        }
++        break;
++    }
++    ret = encode_nals(ctx, pkt, nals, nn);
++    av_free(fixed);
++    if (ret <= 0)
++        return ret;
++    pkt->pts = j->out.i_pts;
++    pkt->dts = j->out.i_dts;
++    out_opaque = j->out.opaque;
++    if (out_opaque >= x4->reordered_opaque &&
++        out_opaque < &x4->reordered_opaque[x4->nb_reordered_opaque]) {
++        pkt->duration = out_opaque->duration;
++        if (ctx->flags & AV_CODEC_FLAG_COPY_OPAQUE) {
++            pkt->opaque                  = out_opaque->frame_opaque;
++            pkt->opaque_ref              = out_opaque->frame_opaque_ref;
++            out_opaque->frame_opaque_ref = NULL;
++        }
++        opaque_uninit(out_opaque);
++    }
++    pkt->flags |= AV_PKT_FLAG_KEY * j->out.b_keyframe;
++    ff_encode_add_stats_side_data(pkt, (j->out.i_qpplus1 - 1) * FF_QP2LAMBDA, NULL, 0,
++                                  j->out.i_type == X264_TYPE_P ? AV_PICTURE_TYPE_P : AV_PICTURE_TYPE_I);
++    return 1;
++}
++
++static void dual_join(X264Context *x4)
++{
++    if (x4->dual_running) {
++        pthread_join(x4->dual_thread, NULL);
++        x4->dual_running = 0;
++    }
++}
++
++static int dual_frame(AVCodecContext *ctx, AVPacket *pkt, const AVFrame *frame, int *got_packet)
++{
++    X264Context *x4 = ctx->priv_data;
++    x264_picture_t *pic_in;
++    int ret;
++
++    *got_packet = 0;
++    if (!frame) {                                 /* flush: the right eye's packet, or a lone left */
++        if (x4->dual_pending->size) {
++            av_packet_move_ref(pkt, x4->dual_pending);
++            *got_packet = 1;
++            return 0;
++        }
++        if (x4->dual_running) {
++            dual_join(x4);
++            ret = dual_packet(ctx, pkt, &x4->job[0], 0);
++            av_frame_free(&x4->job[0].frame);
++            if (ret < 0)
++                return ret;
++            if ((*got_packet = ret))
++                return 0;
++        }
++        /* frames x264 still holds: left, right, left... in stream order */
++        for (int tries = 0; tries < 2; tries++) {
++            int e = x4->dual_n++ & 1;
++            DualJob *j = &x4->job[e];
++            j->enc = e ? x4->enc2 : x4->enc;
++            if (x264_encoder_delayed_frames(j->enc) <= 0)
++                continue;
++            j->ret = x264_encoder_encode(j->enc, &j->nal, &j->nnal, NULL, &j->out);
++            ret = dual_packet(ctx, pkt, j, e);
++            if (ret < 0)
++                return ret;
++            if ((*got_packet = ret))
++                return 0;
++        }
++        return 0;
++    }
++
++    int eye = x4->dual_n++ & 1;
++    DualJob *j = &x4->job[eye];
++    j->frame = av_frame_clone(frame);
++    if (!j->frame)
++        return AVERROR(ENOMEM);
++    ret = setup_frame(ctx, j->frame, &pic_in);
++    if (ret < 0)
++        return ret;
++    j->pic = *pic_in;
++    j->enc = eye ? x4->enc2 : x4->enc;
++
++    if (!eye) {                                   /* left: start it, send last pair's right eye */
++        if (pthread_create(&x4->dual_thread, NULL, dual_worker, j))
++            return AVERROR(ENOMEM);
++        x4->dual_running = 1;
++        if (x4->dual_pending->size) {
++            av_packet_move_ref(pkt, x4->dual_pending);
++            *got_packet = 1;
++        }
++        return 0;
++    }
++
++    dual_worker(j);                               /* right, here, while the left runs */
++    dual_join(x4);
++    ret = dual_packet(ctx, pkt, &x4->job[0], 0); /* stream order: left, then right */
++    if (ret >= 0) {
++        *got_packet = ret;
++        int r2 = dual_packet(ctx, x4->dual_pending, j, 1);
++        if (r2 < 0)
++            ret = r2;
++    }
++    av_frame_free(&x4->job[0].frame);
++    av_frame_free(&j->frame);
++    return ret < 0 ? ret : 0;
++}
++
+ static int X264_frame(AVCodecContext *ctx, AVPacket *pkt, const AVFrame *frame,
+                       int *got_packet)
+ {
+@@ -628,6 +875,9 @@ static int X264_frame(AVCodecContext *ctx, AVPacket *pkt, const AVFrame *frame,
+     int64_t wallclock = 0;
+     X264Opaque *out_opaque;
+ 
++    if (x4->dual)
++        return dual_frame(ctx, pkt, frame, got_packet);
++
+     ret = setup_frame(ctx, frame, &pic_in);
+     if (ret < 0)
+         return ret;
+@@ -774,6 +1024,8 @@ static av_cold int X264_close(AVCodecContext *avctx)
+ {
+     X264Context *x4 = avctx->priv_data;
+ 
++    dual_join(x4);   /* before anything the left eye's thread may still touch goes */
++
+     av_freep(&x4->sei);
+ 
+     for (int i = 0; i < x4->nb_reordered_opaque; i++)
+@@ -784,6 +1036,14 @@ static av_cold int X264_close(AVCodecContext *avctx)
+     x264_param_cleanup(&x4->params);
+ #endif
+ 
++    dual_join(x4);
++    av_frame_free(&x4->job[0].frame);
++    av_frame_free(&x4->job[1].frame);
++    av_packet_free(&x4->dual_pending);
++    if (x4->enc2) {
++        x264_encoder_close(x4->enc2);
++        x4->enc2 = NULL;
++    }
+     if (x4->enc) {
+         x264_encoder_close(x4->enc);
+         x4->enc = NULL;
+@@ -1482,9 +1742,36 @@ static av_cold int X264_init(AVCodecContext *avctx)
+ 
+     avctx->bit_rate = x4->params.rc.i_bitrate*1000LL;
+ 
++    {
++        const char *de = getenv("MOBI_DUAL_EYES");
++        x4->dual = x4->i_mobiclip && de && atoi(de);
++    }
++    if (x4->dual) {
++        /* each encoder sees every other frame: half the keyframe spacing in its frames, the same
++         * in time; fixed spacing in both eyes; no look-ahead holding frames back */
++        int k = x4->params.i_keyint_max > 1 ? (x4->params.i_keyint_max + 1) / 2 : 1;
++        x4->params.i_keyint_max = k;
++        x4->params.i_keyint_min = k;
++        x4->params.i_scenecut_threshold = 0;
++        x4->params.rc.i_lookahead = 0;
++        x4->params.i_sync_lookahead = 0;
++        x4->params.rc.b_mb_tree = 0;
++#ifdef _WIN32
++        _putenv("MOBI_REF_STRIDE=2");
++#else
++        setenv("MOBI_REF_STRIDE", "2", 1);
++#endif
++    }
++
+     x4->enc = x264_encoder_open(&x4->params);
+     if (!x4->enc)
+         return AVERROR_EXTERNAL;
++    if (x4->dual) {
++        x4->enc2 = x264_encoder_open(&x4->params);
++        x4->dual_pending = av_packet_alloc();
++        if (!x4->enc2 || !x4->dual_pending)
++            return AVERROR_EXTERNAL;
++    }
+ 
+     if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
+         ret = set_extradata(avctx);
 diff --git a/native/source/x264/common/base.c b/native/source/x264/common/base.c
 index 36866be..3a684bd 100644
 --- a/native/source/x264/common/base.c
@@ -117,7 +467,7 @@ index 5e6cde3..8064943 100644
              else
              {
 diff --git a/native/source/x264/encoder/cavlc.c b/native/source/x264/encoder/cavlc.c
-index 2d3cb21..770c281 100644
+index 2d3cb21..d6304c3 100644
 --- a/native/source/x264/encoder/cavlc.c
 +++ b/native/source/x264/encoder/cavlc.c
 @@ -1201,7 +1201,16 @@ static void encode_i_block(x264_t *h)
@@ -138,7 +488,29 @@ index 2d3cb21..770c281 100644
  		{
  			bs_write1(s, 1);//don't subdivide into 4x4
  			h->stat.frame.i_mv_bits++;
-@@ -1842,7 +1851,15 @@ static void encode_p_block(x264_t *h)
+@@ -1349,7 +1358,20 @@ static void mobi_encode_p_partition(x264_t *h, int idx, int width, int height, i
+ 		int mvy = h->mb.cache.mv[0][x264_scan8[0] + idx][1] >> 1;
+ 		int dx = mvx - px;
+ 		int dy = mvy - py;
+-		if (ref == 0 && dx == 0 && dy == 0)
++		/* MOBI_REF_STRIDE=n: this encoder sees every n-th frame of the stream (one eye of a 3D
++		 * moflex, the other eye encoded beside it), so its "previous frame" is n frames back in
++		 * the decoder's picture list. The decoder's index is frames back (0 = 1 back, no delta). */
++		static int ref_stride = -1;
++		if( ref_stride < 0 ) { const char *e = getenv( "MOBI_REF_STRIDE" ); ref_stride = e ? atoi( e ) : 1; if( ref_stride < 1 || ref_stride > 5 ) ref_stride = 1; }
++		if (ref_stride > 1)
++		{
++			int back = (ref + 1) * ref_stride;
++			if (back > MOBI_P_PART_FRAME4) back = MOBI_P_PART_FRAME4;   /* i_frame_reference is 1: never */
++			mobi_encode_p_partition_mode(s, width, height, back);
++			bs_write_se(s, dx);
++			bs_write_se(s, dy);
++		}
++		else if (ref == 0 && dx == 0 && dy == 0)
+ 			mobi_encode_p_partition_mode(s, width, height, MOBI_P_PART_FRAME0_DELTA0);
+ 		else
+ 		{
+@@ -1842,7 +1864,15 @@ static void encode_p_block(x264_t *h)
  		for (int k = 0; k < 2; k++)
  		{
  			int i = k == 0 ? cf : cs;
@@ -155,7 +527,7 @@ index 2d3cb21..770c281 100644
  			{
  				bs_write1(s, 1);//don't subdivide into 4x4
  				h->stat.frame.i_mv_bits++;
-@@ -3735,7 +3752,15 @@ static int chroma_size_cavlc( x264_t *h )
+@@ -3735,7 +3765,15 @@ static int chroma_size_cavlc( x264_t *h )
  	for (int i = 0; i < 2; i++)
  	{
  		int p = planes[i];

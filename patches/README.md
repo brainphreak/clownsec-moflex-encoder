@@ -22,6 +22,17 @@ All of it is behind environment switches; with none set, output is byte-identica
 - `MOBI_KEY_DQ=n`, `MOBI_LRD=1`, `MOBI_LAMBDA_FULLQ=1` — experiments (see the notes in the code)
 - the x264 reconstruction dump (`dump-yuv`) writes MobiClip's planar chroma correctly, so encoder output
   can be checked against a decoder byte for byte
+- `MOBI_DUAL_EYES=1` (3D moflex, `-mo_layout 0` interleaved input) — each eye gets its own encoder,
+  run side by side on two threads, and references only its own previous picture (two back in the
+  decoder's list, `MOBI_REF_STRIDE=2`, set automatically). Each P frame's quantizer change is
+  rewritten against the other eye's, and keyframes come at fixed spacing in both eyes (no scene-cut
+  keyframes), so a seek lands on a keyframe pair. On 20 s of 1080p Big Buck Bunny 3D: 2.3x as fast,
+  a third smaller, same quality; on 2 minutes, 20 MB instead of 47 MB, and the Old 3DS decodes it
+  in 15.6 ms per pair instead of 30.1. Nintendo's own 3D files use same-eye references too (about
+  44% of motion blocks in a retail sample), so it is standard MobiClip; the 3DS player's decoder
+  and FFmpeg's decode it bit-identically
+- `MOBI_REF_STRIDE=n` — the encoder sees every n-th frame of the stream: its "previous picture" is
+  n back in the decoder's list
 - the `MOBI_*` switches are read once (a cached `getenv`): the encoder looked them up inside its
   per-macroblock loops, and Windows' C runtime locks and walks the whole environment on every call --
   the Windows build ran at half its speed (no change to the output)
